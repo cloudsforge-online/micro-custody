@@ -27,7 +27,11 @@ import { createHmac } from 'node:crypto'
 import { ethers } from 'ethers'
 import { Keypair } from '@solana/web3.js'
 import * as bitcoin from 'bitcoinjs-lib'
-import { ECDSA, Wallet as XrplWallet } from 'xrpl'
+// xrpl is CommonJS and defines ECDSA with an Object.defineProperty getter, which the CJS module
+// lexer in Node 22 cannot see — `import { ECDSA }` throws at import time there (Node 24's lexer
+// finds it, which is why this only failed in CI). The default import is the module.exports object
+// itself under Node's CJS interop in every version, so the getter is reached at property access.
+import xrpl, { Wallet as XrplWallet } from 'xrpl'
 import { ECPair, bitcoinNetwork, type GeneratedKey, type KeyFamily, type KeyNetwork } from './chains.ts'
 
 /** 256 bits of entropy, so 24 words. A 12-word phrase is fine and this is a custody service. */
@@ -197,7 +201,7 @@ export function deriveKey(
       // first 16 bytes of the derived private key, as secp256k1 entropy — is OURS, it is
       // deterministic, and it is written down in the README because a recovery phrase that only
       // restores under an undocumented rule is not a recovery phrase.
-      const w = XrplWallet.fromEntropy(Array.from(privBuf.subarray(0, 16)), { algorithm: ECDSA.secp256k1 })
+      const w = XrplWallet.fromEntropy(Array.from(privBuf.subarray(0, 16)), { algorithm: xrpl.ECDSA.secp256k1 })
       return { address: w.classicAddress, privateKey: w.seed!, derivationPath: path }
     }
     default:

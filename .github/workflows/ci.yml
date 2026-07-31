@@ -34,6 +34,7 @@ jobs:
         IDENTITY_ISSUER=http://127.0.0.1:4001
         OUTBOX_SIGNING_SECRET=ci-only-not-a-real-secret-000000000000
         POLICY_BASE_URL=http://127.0.0.1:4011
+        CUSTODY_MASTER_SECRET_V1=ci-only-not-a-real-secret-at-least-32-chars-0000
     secrets:
       # @cloudsforge/* is resolved by link:../runtime and link:../contracts, so CI checks out
       # micro-runtime and micro-contracts as siblings — both private, so the workflow needs a
