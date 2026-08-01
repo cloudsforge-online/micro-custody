@@ -185,7 +185,12 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
   const exportCoolingOffHours = integer(source, 'CUSTODY_EXPORT_COOLING_OFF_HOURS', 24, 1, 720)
 
   return {
-    port: integer(source, 'PORT', 4008, 1, 65_535),
+    // 4005, not 4008. micro-indexer also binds 4008, so the two could not run together on one
+    // machine — and the registry has said 4005 for this service all along: `keyvault`, "Custodial
+    // key service" (`ui/packages/ui/src/surfaces.ts:537-542`). The indexer keeps 4008 because four
+    // consumers name it (mint, foresight and market via INDEXER_URL, plus the explorer surface),
+    // where only micro-faucet names custody's.
+    port: integer(source, 'PORT', 4005, 1, 65_535),
     env: optional(source, 'NODE_ENV', 'development'),
     version: optional(source, 'CLOUDSFORGE_TAG', 'dev'),
     logLevel: logLevel as Env['logLevel'],

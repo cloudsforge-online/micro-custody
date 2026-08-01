@@ -167,7 +167,7 @@ CUSTODY_KEY_VERSION=3
 # 3. Drain. The job does this on its own every 30s; this forces it and exits non-zero
 #    while anything remains, so it is safe in a deploy gate.
 pnpm reencrypt
-curl -s localhost:4008/v1/admin/rotation -H "authorization: Bearer $ADMIN"   # remaining must be 0
+curl -s localhost:4005/v1/admin/rotation -H "authorization: Bearer $ADMIN"   # remaining must be 0
 
 # 4. ONLY NOW remove CUSTODY_MASTER_SECRET_V2.
 ```
