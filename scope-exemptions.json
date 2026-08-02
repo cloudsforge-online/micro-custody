@@ -1,0 +1,3 @@
+{
+  "custody:sign:user": "Demandable but deliberately unmintable. /v1/sign validates the claimed purpose against PURPOSES (src/server.ts:110, :429), which includes 'user', so the gate at src/server.ts:433 can demand custody:sign:user — but purposeGate (src/gates.ts:103) refuses user-purpose rows unconditionally: a user-purpose wallet exists so the customer can hold and export it, and the platform signs nothing on their behalf (SD-07). Registering the scope would let identity mint a capability this service exists to refuse."
+}
