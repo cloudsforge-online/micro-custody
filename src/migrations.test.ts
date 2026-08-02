@@ -103,8 +103,56 @@ test('the treasury pin can only reference an address this service holds', { skip
       insert into custody_treasuries (chain, network, address, set_by)
       values ('ethereum', 'testnet', '0xnot-a-key-we-hold', 'op')
     `,
-    /foreign key|custody_treasuries_address_fkey/,
+    /foreign key|custody_treasuries_key_fk/,
   )
+})
+
+test('the treasury pin is a TREASURY address, on THIS chain and THIS network — in the schema', { skip }, async () => {
+  /*
+   * `store.pinTreasury` checks all three and is the only writer. This asserts the DATABASE checks
+   * them too, which is the property that matters now that BTC and SOL sweeps exist: every family's
+   * sweep pays whatever address this row names, so a bug, a future migration, an offline adoption
+   * script or an operator at a psql prompt must not be able to make it name something else.
+   *
+   * Written as raw INSERTs deliberately — going through `pinTreasury` would prove the function's
+   * check, which is not the thing under test.
+   */
+  const insertKeyRow = (address: string, chain: string, network: string, purpose: string) => sql`
+    insert into custody_keys (address, chain, family, purpose, network, user_id, order_id, scheme,
+                              key_version, storage, created_by)
+    values (${address}, ${chain}, 'evm', ${purpose}, ${network}, 'u', 'o', 'flat_random', 2, 'file', 'test')
+  `
+  await insertKeyRow('0xtreasury-eth-testnet', 'ethereum', 'testnet', 'treasury')
+  await insertKeyRow('0xdeposit-eth-testnet', 'ethereum', 'testnet', 'deposit')
+  await insertKeyRow('0xtreasury-eth-mainnet', 'ethereum', 'mainnet', 'treasury')
+  await insertKeyRow('0xtreasury-ember-testnet', 'ember', 'testnet', 'treasury')
+
+  const pin = (chain: string, network: string, address: string) => sql`
+    insert into custody_treasuries (chain, network, address, set_by)
+    values (${chain}, ${network}, ${address}, 'op')
+  `
+
+  // A CUSTOMER'S DEPOSIT ADDRESS. The one that would matter: pin it and every sweep in the estate
+  // pays an address whose key the platform holds but whose purpose says it is somebody's deposit.
+  await assert.rejects(() => pin('ethereum', 'testnet', '0xdeposit-eth-testnet'), /custody_treasuries_key_fk/)
+  // A treasury on the WRONG NETWORK. Same chain, real treasury, mainnet — a testnet sweep signed to
+  // a mainnet address is coins sent to an address nobody controls on the network they were sent on.
+  await assert.rejects(() => pin('ethereum', 'testnet', '0xtreasury-eth-mainnet'), /custody_treasuries_key_fk/)
+  // A treasury on the WRONG CHAIN.
+  await assert.rejects(() => pin('ethereum', 'testnet', '0xtreasury-ember-testnet'), /custody_treasuries_key_fk/)
+  // And `purpose` cannot be talked out of being 'treasury' to satisfy the reference.
+  await assert.rejects(
+    () => sql`
+      insert into custody_treasuries (chain, network, address, set_by, purpose)
+      values ('ethereum', 'testnet', '0xdeposit-eth-testnet', 'op', 'deposit')
+    `,
+    /custody_treasuries_purpose_ck/,
+  )
+
+  // The one that is allowed, so the test proves a constraint rather than a broken table.
+  await pin('ethereum', 'testnet', '0xtreasury-eth-testnet')
+  const rows = await sql<{ address: string }[]>`select address from custody_treasuries`
+  assert.deepEqual(rows.map((r) => r.address), ['0xtreasury-eth-testnet'])
 })
 
 test('a signing audit row must be one of exactly two outcomes', { skip }, async () => {

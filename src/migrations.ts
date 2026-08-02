@@ -214,6 +214,76 @@ export const MIGRATIONS: readonly Migration[] = [
       create index if not exists key_exports_user_idx on key_exports (user_id, requested_at desc);
     `,
   },
+  {
+    version: 5,
+    name: 'treasury_pin_integrity',
+    /*
+     * THE PIN IS NOW THE SAFETY PROPERTY FOR EVERY FAMILY, SO IT STOPS BEING A CODE-LEVEL RULE.
+     *
+     * Until Bitcoin and Solana gained sweep shapes, a `deposit`-purpose address in those families
+     * could not be signed for at all — `gates.SWEEPABLE_FAMILIES` refused it. What replaced that
+     * refusal is the pinned destination: every output of a BTC sweep, and the sole destination of a
+     * SOL sweep, must be `custody_treasuries.address` for the row's own (chain, network). Five
+     * families now depend on that row being what it claims to be.
+     *
+     * `store.pinTreasury` validates exactly that and is the only writer — the address must exist,
+     * carry `purpose = 'treasury'`, and sit on the SAME chain and the SAME network as the pin. But
+     * that is a rule in a TypeScript function, and the estate's rule (03 §2) is that an invariant
+     * money depends on lives in the schema, where a bug, a future migration, an offline adoption
+     * script or an operator with a psql prompt cannot route around it. Migration 4's foreign key
+     * checked only that the address EXISTS in `custody_keys`; it permitted pinning a customer's
+     * `deposit` address, or a treasury on a different chain, and every sweep in the estate would
+     * then have paid it.
+     *
+     * The composite key carries all three facts at once. `purpose` is denormalised onto the pin row
+     * so it can participate in the reference, and a CHECK holds it at 'treasury' — the FK then says
+     * "there is a custody_keys row with this address, this chain, this network AND purpose
+     * 'treasury'", which is `pinTreasury`'s validation minus nothing except `status`.
+     *
+     * WHY `status` IS NOT IN THE KEY, said explicitly because its absence looks like an omission.
+     * `status` is the one mutable column of the four, so including it would make `markExported`
+     * fail against a pinned row rather than merely refuse — and it would make the FK a lock on a
+     * lifecycle transition, which is not what a reference is for. It does not need to be here:
+     * `exports.requestExport` refuses a `treasury` or `deployer` address outright with
+     * 'platform-owned addresses are not user-exportable', so a pinned treasury cannot reach
+     * 'exported' by any route, and `pinTreasury` refuses to pin one that is not active.
+     *
+     * THE BACKFILL, AND WHAT IT WOULD DO TO A BAD ROW. `purpose` defaults to 'treasury', so every
+     * existing pin is asserted to be one and the FK is validated against it as the migration runs. A
+     * pin that was never valid would therefore fail the migration with a bare 23503 rather than the
+     * named refusal `pinTreasury` gives — and `index.ts` asserts the schema version at boot, so the
+     * service would refuse to serve rather than sweep to it. That is the right way round, and it is
+     * also unreachable: custody is a NEW database (`BASELINE_VERSION = 0`) and `pinTreasury` has
+     * been the only writer of this table since migration 4 created it.
+     */
+    up: `
+      -- Backs the reference below. address is already the primary key, so this is unique for free
+      -- and exists only so the composite foreign key has something to point at.
+      create unique index if not exists custody_keys_pin_target_uniq
+        on custody_keys (address, chain, network, purpose);
+
+      alter table custody_treasuries
+        add column if not exists purpose text not null default 'treasury';
+
+      alter table custody_treasuries
+        drop constraint if exists custody_treasuries_purpose_ck;
+      alter table custody_treasuries
+        add constraint custody_treasuries_purpose_ck check (purpose = 'treasury');
+
+      -- Migration 4's 'references custody_keys (address)', which postgres named for us. Dropped
+      -- rather than kept because the reference below is strictly stronger: same address column,
+      -- three more facts.
+      alter table custody_treasuries
+        drop constraint if exists custody_treasuries_address_fkey;
+
+      alter table custody_treasuries
+        drop constraint if exists custody_treasuries_key_fk;
+      alter table custody_treasuries
+        add constraint custody_treasuries_key_fk
+          foreign key (address, chain, network, purpose)
+          references custody_keys (address, chain, network, purpose);
+    `,
+  },
 ]
 
 /**

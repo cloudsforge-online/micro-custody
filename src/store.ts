@@ -10,6 +10,13 @@
  *      ever name an address this service minted, with `purpose = 'treasury'`, on the same chain and
  *      the same network — so a typo produces a refusal rather than a pin, and an attacker cannot pin
  *      an address they hold the key to, because this service has never seen one.
+ *
+ *      **THREE QUARTERS OF THAT IS ALSO A FOREIGN KEY** — migration 5's
+ *      `custody_treasuries_key_fk`, on (address, chain, network, purpose). The function stays,
+ *      because it is what turns a violation into a NAMED refusal an operator can read instead of a
+ *      23503; but it is no longer the only thing standing between a sweep and an address it should
+ *      never pay. Every family's sweep now depends on this row, and an invariant money depends on
+ *      belongs where a bug, a migration or a psql prompt cannot route around it.
  */
 
 import type { Db, Tx } from './outbox.ts'

@@ -13,12 +13,23 @@ import { deriveKey, newMnemonic, seedFromMnemonic } from './hd.ts'
 import {
   bindingMatches,
   bindingMismatches,
+  bitcoinShapeForPurpose,
   evmShapeForPurpose,
   purposeGate,
   resolveChainId,
+  solanaShapeForPurpose,
   type RowIdentity,
 } from './gates.ts'
-import { SignRefused, signBitcoin, signEvm, signSolana, signXrp, type EvmPolicy } from './signing.ts'
+import {
+  SignRefused,
+  signBitcoin,
+  signEvm,
+  signSolana,
+  signXrp,
+  type BitcoinPolicy,
+  type EvmPolicy,
+  type SolanaPolicy,
+} from './signing.ts'
 import { withOutbox, type Db, type Tx } from './outbox.ts'
 import {
   getKey,
@@ -253,7 +264,7 @@ export async function signForAddress(deps: KeyDeps, request: SignRequest): Promi
     status: row.status,
   }
   const payloadDigest = digestOf(request.payload)
-  const shape = isEvmFamily(row.family) ? evmShapeForPurpose(row.purpose) : row.family
+  const shape = shapeForRow(row.family, row.purpose)
 
   const refused = async (status: number, code: string, gate: string, error: string): Promise<SignOutcome> => {
     await auditOnly(deps, {
@@ -390,6 +401,23 @@ export async function signForAddress(deps: KeyDeps, request: SignRequest): Promi
   return { ok: true, signedTx, auditId }
 }
 
+/**
+ * The signing SHAPE recorded on the audit row, for every family that has one.
+ *
+ * It used to fall back to the family NAME for anything not EVM, because only EVM had named shapes.
+ * Solana and Bitcoin have them now, and recording `'bitcoin'` where the policy actually chosen was
+ * `'sweep'` would make the audit trail unable to answer the one question a dispute asks of it:
+ * which policy did this signature go through. `xrp` still records the family name — `signXrp` takes
+ * its shape from a purpose comparison inline rather than from a mapping function, and inventing one
+ * here to feed an audit column would be a second place the XRP mapping lives.
+ */
+function shapeForRow(family: string, purpose: string): string {
+  if (isEvmFamily(family)) return evmShapeForPurpose(purpose)
+  if (family === 'solana') return solanaShapeForPurpose(purpose)
+  if (family === 'bitcoin') return bitcoinShapeForPurpose(purpose)
+  return family
+}
+
 function rowIdentity(row: CustodyKeyRow): RowIdentity {
   return {
     address: row.address,
@@ -429,12 +457,18 @@ async function produceSignature(
           : { chainId: ctx.chainId, shape, legacyOnly: row.family === 'ember' }
       return signEvm(privateKey, payload, policy)
     }
-    case 'solana':
-      // Unreachable for purpose 'deposit' — SWEEPABLE_FAMILIES refused it at gate 1.
-      return signSolana(privateKey, payload, row.address)
-    case 'bitcoin':
-      // Likewise unreachable for purpose 'deposit'.
-      return signBitcoin(privateKey, payload, row.address, ctx.network)
+    case 'solana': {
+      const shape = solanaShapeForPurpose(row.purpose)
+      // A union member, not an object with an optional pin, for `EvmPolicy`'s reason: a 'sweep' with
+      // no pin must not compile.
+      const policy: SolanaPolicy = shape === 'sweep' ? { shape, treasuryPin: ctx.treasuryPin } : { shape }
+      return signSolana(privateKey, payload, row.address, policy)
+    }
+    case 'bitcoin': {
+      const shape = bitcoinShapeForPurpose(row.purpose)
+      const policy: BitcoinPolicy = shape === 'sweep' ? { shape, treasuryPin: ctx.treasuryPin } : { shape }
+      return signBitcoin(privateKey, payload, row.address, ctx.network, policy)
+    }
     case 'xrp':
       return signXrp(
         privateKey,

@@ -18,7 +18,15 @@ import { Keypair, PublicKey, SystemProgram, Transaction as SolanaTransaction, Tr
 import * as bitcoin from 'bitcoinjs-lib'
 import { Wallet as XrplWallet } from 'xrpl'
 import { ECPair, bitcoinNetwork } from './chains.ts'
-import { SignRefused, signBitcoin, signEvm, signSolana, signXrp } from './signing.ts'
+import {
+  SignRefused,
+  signBitcoin,
+  signEvm,
+  signSolana,
+  signXrp,
+  type BitcoinPolicy,
+  type SolanaPolicy,
+} from './signing.ts'
 
 const CHAIN_ID = 11_155_111
 
@@ -236,47 +244,202 @@ function splInstruction(tag: number, keys: PublicKey[]): TransactionInstruction 
   })
 }
 
-test('Solana: initializeMint2 and mintTo are signed', () => {
+const SOL_TREASURY = Keypair.generate().publicKey
+const SOL_STRANGER = Keypair.generate().publicKey
+
+const MINT: SolanaPolicy = { shape: 'mint' }
+const SOL_TRANSFER: SolanaPolicy = { shape: 'transfer' }
+const SOL_SWEEP: SolanaPolicy = { shape: 'sweep', treasuryPin: SOL_TREASURY.toBase58() }
+/** Every shape, so a rule that must hold under all three is asserted under all three. */
+const SOL_SHAPES: readonly SolanaPolicy[] = [MINT, SOL_TRANSFER, SOL_SWEEP]
+
+function solTransferIx(to: PublicKey, lamports = 1_000_000, from = solKeypair.publicKey): TransactionInstruction {
+  return SystemProgram.transfer({ fromPubkey: from, toPubkey: to, lamports })
+}
+
+test('Solana: initializeMint2 and mintTo are signed under the MINT shape', () => {
   const mint = Keypair.generate().publicKey
   const payload = solanaTx([
     splInstruction(20, [mint]),
     splInstruction(7, [mint, Keypair.generate().publicKey, solKeypair.publicKey]),
   ])
-  const signed = signSolana(solSecret, payload, solAddress)
+  const signed = signSolana(solSecret, payload, solAddress, MINT)
   assert.equal(SolanaTransaction.from(Buffer.from(signed, 'base64')).signatures.length, 1)
 })
 
 test('Solana: SetAuthority (tag 6) is REFUSED — it hands the mint to someone else permanently', () => {
   const payload = solanaTx([splInstruction(6, [Keypair.generate().publicKey, solKeypair.publicKey])])
-  assert.throws(() => signSolana(solSecret, payload, solAddress), (err: unknown) => {
+  assert.throws(() => signSolana(solSecret, payload, solAddress, MINT), (err: unknown) => {
     assert.ok(err instanceof SignRefused)
     assert.match((err as Error).message, /SPL token instruction 6 is not one this service signs for/)
     return true
   })
 })
 
-test('Solana: every one of Transfer, Approve, SetAuthority, Burn and CloseAccount is refused', () => {
+test('Solana: Transfer, Approve, SetAuthority, Burn and CloseAccount are refused under EVERY shape', () => {
   // SD-09 names all five. They are every way to move or reassign what the address holds, so they are
   // asserted as a set rather than one at a time — a future widening that admitted one of them would
   // otherwise only fail a test somebody could read as being about SetAuthority.
-  for (const tag of [3, 4, 6, 8, 9]) {
-    const payload = solanaTx([splInstruction(tag, [solKeypair.publicKey, solKeypair.publicKey, solKeypair.publicKey])])
-    assert.throws(() => signSolana(solSecret, payload, solAddress), SignRefused, `tag ${tag} was not refused`)
+  //
+  // ASSERTED UNDER ALL THREE SHAPES, which is what stops "SOL can be transferred now" from quietly
+  // meaning "SPL Transfer can be too". They are different instructions with different risks: the
+  // system Transfer below moves the vault's own lamports, SPL tag 3 moves a token balance out of a
+  // token account and has no caller in this estate.
+  for (const policy of SOL_SHAPES) {
+    for (const tag of [3, 4, 6, 8, 9]) {
+      const payload = solanaTx([splInstruction(tag, [solKeypair.publicKey, solKeypair.publicKey, solKeypair.publicKey])])
+      assert.throws(
+        () => signSolana(solSecret, payload, solAddress, policy),
+        SignRefused,
+        `tag ${tag} was not refused under ${policy.shape}`,
+      )
+    }
   }
 })
 
-test('Solana: a SystemProgram transfer is refused — there is no SOL transfer shape at all', () => {
-  const payload = solanaTx([
-    SystemProgram.transfer({
-      fromPubkey: solKeypair.publicKey,
-      toPubkey: Keypair.generate().publicKey,
-      lamports: 1_000_000,
-    }),
-  ])
-  assert.throws(() => signSolana(solSecret, payload, solAddress), SignRefused)
+test('Solana: a DEPLOYER key still cannot move a lamport — the mint shape refuses SystemProgram Transfer', () => {
+  // The refusal that used to apply to every purpose. It is the deployer's rule now, and narrowing it
+  // to that purpose is not the same as relaxing it: `mint` is what `micro-mint` signs SPL deploys
+  // with, and a deploy key that could also transfer is a deploy key whose balance is one signature
+  // away — `assertCreation`'s argument, in another family.
+  const payload = solanaTx([solTransferIx(SOL_STRANGER)])
+  assert.throws(
+    () => signSolana(solSecret, payload, solAddress, MINT),
+    (err: unknown) => err instanceof SignRefused && /only system-program instruction this service signs is createAccount/.test((err as Error).message),
+  )
 })
 
-test('Solana: an unknown program is refused', () => {
+test('Solana: a TREASURY key signs one System Transfer to an address the caller names', () => {
+  const payload = solanaTx([solTransferIx(SOL_STRANGER)])
+  const signed = signSolana(solSecret, payload, solAddress, SOL_TRANSFER)
+  const parsed = SolanaTransaction.from(Buffer.from(signed, 'base64'))
+  assert.equal(parsed.signatures.length, 1)
+  assert.equal(parsed.feePayer?.toBase58(), solAddress)
+})
+
+test('Solana: a TREASURY key may NOT create an account — createAccount is the deployer shape only', () => {
+  // The 50,000,000-lamport hazard, and the half of this change that is a NARROWING. Before the
+  // shapes were disjoint, a treasury-purpose SOL address got the whole mint-creation set even though
+  // the only caller that needs it mints under `purpose: 'deployer'`.
+  const payload = solanaTx([
+    SystemProgram.createAccount({
+      fromPubkey: solKeypair.publicKey,
+      newAccountPubkey: Keypair.generate().publicKey,
+      lamports: 50_000_000,
+      space: 82,
+      programId: TOKEN_PROGRAM,
+    }),
+  ])
+  for (const policy of [SOL_TRANSFER, SOL_SWEEP]) {
+    assert.throws(
+      () => signSolana(solSecret, payload, solAddress, policy),
+      (err: unknown) =>
+        err instanceof SignRefused &&
+        /only system-program instruction a solana transfer signs is Transfer/.test((err as Error).message),
+      policy.shape,
+    )
+  }
+})
+
+test('SD-09 §4 — a SOL sweep to anything but the pin is refused', () => {
+  const payload = solanaTx([solTransferIx(SOL_STRANGER)])
+  assert.throws(
+    () => signSolana(solSecret, payload, solAddress, SOL_SWEEP),
+    (err: unknown) =>
+      err instanceof SignRefused && /a sweep does not choose its own destination/.test((err as Error).message),
+  )
+})
+
+test('SD-09 §4 — a SOL sweep TO the pin is signed, and that is the only destination there is', () => {
+  const payload = solanaTx([solTransferIx(SOL_TREASURY)])
+  const signed = signSolana(solSecret, payload, solAddress, SOL_SWEEP)
+  assert.equal(SolanaTransaction.from(Buffer.from(signed, 'base64')).signatures.length, 1)
+})
+
+test('SD-09 §4 — a SOL sweep with no pin, or an unusable one, is refused rather than defaulted', () => {
+  const payload = solanaTx([solTransferIx(SOL_TREASURY)])
+  for (const pin of ['', 'not-a-base58-pubkey', ` ${SOL_TREASURY.toBase58()} `]) {
+    assert.throws(
+      () => signSolana(solSecret, payload, solAddress, { shape: 'sweep', treasuryPin: pin }),
+      (err: unknown) => err instanceof SignRefused && /no usable treasury is pinned/.test((err as Error).message),
+      `pin ${JSON.stringify(pin)} was not refused`,
+    )
+  }
+})
+
+test('Solana: a transfer is EXACTLY ONE instruction — nothing rides alongside it', () => {
+  // `partialSign` signs the whole message, so a second instruction beside a legitimate Transfer is
+  // covered by the same signature and cannot be separated from it afterwards. The piggyback is the
+  // attack: a sweep paying the pin, plus a createAccount parking the rest somewhere unrecoverable.
+  const payload = solanaTx([
+    solTransferIx(SOL_TREASURY),
+    SystemProgram.createAccount({
+      fromPubkey: solKeypair.publicKey,
+      newAccountPubkey: Keypair.generate().publicKey,
+      lamports: 50_000_000,
+      space: 82,
+      programId: TOKEN_PROGRAM,
+    }),
+  ])
+  for (const policy of [SOL_TRANSFER, SOL_SWEEP]) {
+    assert.throws(
+      () => signSolana(solSecret, payload, solAddress, policy),
+      (err: unknown) => err instanceof SignRefused && /exactly one instruction/.test((err as Error).message),
+      policy.shape,
+    )
+  }
+})
+
+test('Solana: a transfer requiring a SECOND signature is refused, not half-signed', () => {
+  // A System Transfer needs the source account's signature and no other. A message declaring a
+  // second required signer would be handed back half-signed — a blob the caller completes later
+  // with a counterparty of its choosing. It is also the shape that made `serialize()` throw a plain
+  // Error, which reaches the route as a 500 with no audit row; the rate limiter counts audit rows.
+  const tx = new SolanaTransaction({ feePayer: solKeypair.publicKey, recentBlockhash: BLOCKHASH })
+  tx.add(
+    new TransactionInstruction({
+      programId: new PublicKey('11111111111111111111111111111111'),
+      keys: [
+        { pubkey: solKeypair.publicKey, isSigner: true, isWritable: true },
+        { pubkey: SOL_TREASURY, isSigner: false, isWritable: true },
+        // A third account the message declares a signature is required for.
+        { pubkey: SOL_STRANGER, isSigner: true, isWritable: false },
+      ],
+      data: solTransferIx(SOL_TREASURY).data,
+    }),
+  )
+  const payload = tx.serialize({ requireAllSignatures: false, verifySignatures: false }).toString('base64')
+  for (const policy of [SOL_TRANSFER, SOL_SWEEP]) {
+    assert.throws(
+      () => signSolana(solSecret, payload, solAddress, policy),
+      (err: unknown) => err instanceof SignRefused && /exactly one signature/.test((err as Error).message),
+      policy.shape,
+    )
+  }
+})
+
+test('Solana: a Transfer must be FUNDED by the vault address, not merely fee-paid by it', () => {
+  // `keys[0]` is the account being debited and it is not the same field as the fee payer. A Transfer
+  // out of somebody else's account, fee-paid by ours, is a signature this service has no business on.
+  const payload = solanaTx([solTransferIx(SOL_TREASURY, 1_000_000, SOL_STRANGER)])
+  assert.throws(
+    () => signSolana(solSecret, payload, solAddress, SOL_TRANSFER),
+    (err: unknown) => err instanceof SignRefused && /must be funded by the vault address/.test((err as Error).message),
+  )
+})
+
+test('Solana: a zero-lamport Transfer, and one paying this address itself, are refused', () => {
+  assert.throws(
+    () => signSolana(solSecret, solanaTx([solTransferIx(SOL_STRANGER, 0)]), solAddress, SOL_TRANSFER),
+    (err: unknown) => err instanceof SignRefused && /zero lamports/.test((err as Error).message),
+  )
+  assert.throws(
+    () => signSolana(solSecret, solanaTx([solTransferIx(solKeypair.publicKey)]), solAddress, SOL_TRANSFER),
+    (err: unknown) => err instanceof SignRefused && /to the vault address itself/.test((err as Error).message),
+  )
+})
+
+test('Solana: an unknown program is refused under every shape', () => {
   const payload = solanaTx([
     new TransactionInstruction({
       programId: Keypair.generate().publicKey,
@@ -284,13 +447,15 @@ test('Solana: an unknown program is refused', () => {
       data: Buffer.from([0]),
     }),
   ])
-  assert.throws(() => signSolana(solSecret, payload, solAddress), SignRefused)
+  for (const policy of SOL_SHAPES) {
+    assert.throws(() => signSolana(solSecret, payload, solAddress, policy), SignRefused, policy.shape)
+  }
 })
 
 test('Solana: the fee payer must be this address', () => {
   const payload = solanaTx([splInstruction(20, [Keypair.generate().publicKey])], Keypair.generate().publicKey)
   assert.throws(
-    () => signSolana(solSecret, payload, solAddress),
+    () => signSolana(solSecret, payload, solAddress, MINT),
     (err: unknown) => err instanceof SignRefused && /fee payer must be the vault address/.test((err as Error).message),
   )
 })
@@ -308,7 +473,7 @@ test('Solana: createAccount may only allocate an SPL mint account', () => {
     }),
   ])
   assert.throws(
-    () => signSolana(solSecret, payload, solAddress),
+    () => signSolana(solSecret, payload, solAddress, MINT),
     (err: unknown) => err instanceof SignRefused && /only allocate an SPL mint account/.test((err as Error).message),
   )
 })
@@ -321,7 +486,20 @@ const btcPayment = bitcoin.payments.p2wpkh({ pubkey: Buffer.from(btcKey.publicKe
 const foreignKey = ECPair.makeRandom({ network: btcNetwork })
 const foreignPayment = bitcoin.payments.p2wpkh({ pubkey: Buffer.from(foreignKey.publicKey), network: btcNetwork })
 
-function psbt(options: { script?: Buffer; sighashType?: number; noWitnessUtxo?: boolean } = {}): string {
+const btcTreasuryKey = ECPair.makeRandom({ network: btcNetwork })
+const btcTreasury = bitcoin.payments.p2wpkh({ pubkey: Buffer.from(btcTreasuryKey.publicKey), network: btcNetwork })
+const BTC_PAYMENT: BitcoinPolicy = { shape: 'payment' }
+const BTC_SWEEP: BitcoinPolicy = { shape: 'sweep', treasuryPin: btcTreasury.address! }
+
+interface PsbtOptions {
+  readonly script?: Buffer
+  readonly sighashType?: number
+  readonly noWitnessUtxo?: boolean
+  /** Output scripts, in order. Defaults to the one foreign output the payment tests want. */
+  readonly outputs?: readonly Buffer[]
+}
+
+function psbt(options: PsbtOptions = {}): string {
   const p = new bitcoin.Psbt({ network: btcNetwork })
   const input: Parameters<bitcoin.Psbt['addInput']>[0] = {
     hash: Buffer.alloc(32, 7),
@@ -330,12 +508,13 @@ function psbt(options: { script?: Buffer; sighashType?: number; noWitnessUtxo?: 
     ...(options.sighashType === undefined ? {} : { sighashType: options.sighashType }),
   }
   p.addInput(input)
-  p.addOutput({ address: foreignPayment.address!, value: 90_000 })
+  const outputs = options.outputs ?? [foreignPayment.output!]
+  for (const script of outputs) p.addOutput({ script, value: Math.floor(90_000 / outputs.length) })
   return p.toBase64()
 }
 
 test('Bitcoin: a PSBT spending this address is signed and finalised', () => {
-  const hex = signBitcoin(btcKey.toWIF(), psbt(), btcPayment.address!, 'testnet')
+  const hex = signBitcoin(btcKey.toWIF(), psbt(), btcPayment.address!, 'testnet', BTC_PAYMENT)
   assert.match(hex, /^[0-9a-f]+$/)
 })
 
@@ -343,14 +522,15 @@ test('Bitcoin: a PSBT with a FOREIGN input is refused', () => {
   // Every input must be a P2WPKH output of this very address, so the service can only ever spend its
   // own coins. `signAllInputs` signs all of them, so one foreign input would be signed too.
   assert.throws(
-    () => signBitcoin(btcKey.toWIF(), psbt({ script: foreignPayment.output! }), btcPayment.address!, 'testnet'),
+    () =>
+      signBitcoin(btcKey.toWIF(), psbt({ script: foreignPayment.output! }), btcPayment.address!, 'testnet', BTC_PAYMENT),
     (err: unknown) => err instanceof SignRefused && /does not spend this vault address/.test((err as Error).message),
   )
 })
 
 test('Bitcoin: an input with no witnessUtxo is refused — its value is unknown', () => {
   assert.throws(
-    () => signBitcoin(btcKey.toWIF(), psbt({ noWitnessUtxo: true }), btcPayment.address!, 'testnet'),
+    () => signBitcoin(btcKey.toWIF(), psbt({ noWitnessUtxo: true }), btcPayment.address!, 'testnet', BTC_PAYMENT),
     (err: unknown) => err instanceof SignRefused && /its value is unknown/.test((err as Error).message),
   )
 })
@@ -363,6 +543,7 @@ test('Bitcoin: anything but SIGHASH_ALL is refused — it leaves the rest of the
         psbt({ sighashType: bitcoin.Transaction.SIGHASH_SINGLE }),
         btcPayment.address!,
         'testnet',
+        BTC_PAYMENT,
       ),
     (err: unknown) => err instanceof SignRefused && /only SIGHASH_ALL is signed/.test((err as Error).message),
   )
@@ -370,7 +551,7 @@ test('Bitcoin: anything but SIGHASH_ALL is refused — it leaves the rest of the
 
 test('Bitcoin: a raw transaction is refused — only a PSBT carries each input value', () => {
   assert.throws(
-    () => signBitcoin(btcKey.toWIF(), { version: 2 }, btcPayment.address!, 'testnet'),
+    () => signBitcoin(btcKey.toWIF(), { version: 2 }, btcPayment.address!, 'testnet', BTC_PAYMENT),
     (err: unknown) => err instanceof SignRefused && /must be a base64 PSBT/.test((err as Error).message),
   )
 })
@@ -378,7 +559,113 @@ test('Bitcoin: a raw transaction is refused — only a PSBT carries each input v
 test('Bitcoin: the WIF carries the network, so a mainnet key cannot satisfy a testnet request', () => {
   const mainnetKey = ECPair.makeRandom({ network: bitcoinNetwork('mainnet') })
   // Not a SignRefused: a key that does not match the row is a fault in here, not the caller's fault.
-  assert.throws(() => signBitcoin(mainnetKey.toWIF(), psbt(), btcPayment.address!, 'testnet'))
+  assert.throws(() => signBitcoin(mainnetKey.toWIF(), psbt(), btcPayment.address!, 'testnet', BTC_PAYMENT))
+})
+
+/* ---------------------------------------------- Bitcoin: the sweep output policy */
+
+test('SD-09 §4 — a BTC sweep paying only the pin is signed', () => {
+  const hex = signBitcoin(btcKey.toWIF(), psbt({ outputs: [btcTreasury.output!] }), btcPayment.address!, 'testnet', BTC_SWEEP)
+  assert.match(hex, /^[0-9a-f]+$/)
+})
+
+test('SD-09 §4 — a BTC sweep to anything but the pin is refused', () => {
+  // The same PSBT the payment tests sign happily. `purpose` selects the policy, so the identical
+  // bytes are a withdrawal from a treasury and a refusal from a deposit address.
+  assert.throws(
+    () => signBitcoin(btcKey.toWIF(), psbt(), btcPayment.address!, 'testnet', BTC_SWEEP),
+    (err: unknown) =>
+      err instanceof SignRefused && /psbt output 0 does not pay the treasury address pinned/.test((err as Error).message),
+  )
+})
+
+test('SD-09 §4 — a BTC sweep with a CHANGE output is refused whole, not partially signed', () => {
+  // THE ONE THIS POLICY EXISTS FOR. A sweep leaves nothing behind, so an output paying the source
+  // address back is not change, it is the sweep failing to be a sweep — and worse, `signAllInputs`
+  // signs every input at once, so the pin-paying output cannot be signed while the other is not.
+  // Refused whole is the only correct outcome, and it is asserted for BOTH orderings because a
+  // check that stopped at the first output would pass one of them.
+  for (const outputs of [
+    [btcTreasury.output!, btcPayment.output!],
+    [btcPayment.output!, btcTreasury.output!],
+  ]) {
+    assert.throws(
+      () => signBitcoin(btcKey.toWIF(), psbt({ outputs }), btcPayment.address!, 'testnet', BTC_SWEEP),
+      (err: unknown) => err instanceof SignRefused && /every output of a sweep pays the pin, change included/.test((err as Error).message),
+    )
+  }
+})
+
+test('SD-09 §4 — a BTC sweep output with no renderable address is refused, not skipped', () => {
+  // An OP_RETURN has no `address` at all, so a policy comparing address STRINGS would have had to
+  // decide what `undefined === pin` means. Comparing scripts makes the question not arise.
+  // OP_RETURN, a 4-byte push, "burn". Written as bytes rather than via `script.compile` because the
+  // opcode table is index-typed and `noUncheckedIndexedAccess` makes every entry `| undefined`.
+  const opReturn = Buffer.from('6a046275726e', 'hex')
+  assert.throws(
+    () => signBitcoin(btcKey.toWIF(), psbt({ outputs: [btcTreasury.output!, opReturn] }), btcPayment.address!, 'testnet', BTC_SWEEP),
+    (err: unknown) => err instanceof SignRefused && /psbt output 1 does not pay the treasury/.test((err as Error).message),
+  )
+})
+
+test('SD-09 §4 — a BTC sweep with no pin, or a pin from the wrong network, is refused rather than defaulted', () => {
+  const mainnetTreasury = bitcoin.payments.p2wpkh({
+    pubkey: Buffer.from(ECPair.makeRandom({ network: bitcoinNetwork('mainnet') }).publicKey),
+    network: bitcoinNetwork('mainnet'),
+  })
+  for (const pin of ['', 'not-an-address', mainnetTreasury.address!]) {
+    assert.throws(
+      () =>
+        signBitcoin(btcKey.toWIF(), psbt({ outputs: [btcTreasury.output!] }), btcPayment.address!, 'testnet', {
+          shape: 'sweep',
+          treasuryPin: pin,
+        }),
+      (err: unknown) => err instanceof SignRefused && /no usable treasury is pinned/.test((err as Error).message),
+      `pin ${JSON.stringify(pin)} was not refused`,
+    )
+  }
+})
+
+test('SD-09 §4 — a BTC sweep may not burn the deposit as FEE, even paying only the pin', () => {
+  // The pin bounds where a sweep may pay. It does NOT bound how much: the whole deposit on the input
+  // side and one dust output to the pin satisfies every other rule, and the remainder is fee. That
+  // is destruction rather than theft, and it is available to exactly the credential the pin exists
+  // to make harmless — so the fee-rate ceiling is part of the sweep policy, not an afterthought.
+  const p = new bitcoin.Psbt({ network: btcNetwork })
+  p.addInput({
+    hash: Buffer.alloc(32, 7),
+    index: 0,
+    witnessUtxo: { script: btcPayment.output!, value: 10_000_000 },
+    sighashType: bitcoin.Transaction.SIGHASH_ALL,
+  })
+  // A 110-vByte transaction, so this leaves ~2727 sat/vB as fee: over the sweep ceiling of 1000 and
+  // under the 5000 a payment is still allowed.
+  p.addOutput({ script: btcTreasury.output!, value: 9_700_000 })
+  const greedy = p.toBase64()
+
+  assert.throws(
+    () => signBitcoin(btcKey.toWIF(), greedy, btcPayment.address!, 'testnet', BTC_SWEEP),
+    (err: unknown) =>
+      err instanceof SignRefused && /pays 2727 sat\/vB in fee, above the 1000/.test((err as Error).message),
+  )
+  // And it is a REFUSAL, not the bare Error bitcoinjs throws — a 500 writes no audit row, and the
+  // rate limiter counts audit rows, so an unaudited path is one a caller can probe without limit.
+  // The same PSBT under the payment shape is signed: a treasury's residual is SDR-05, not this.
+  assert.match(signBitcoin(btcKey.toWIF(), greedy, btcPayment.address!, 'testnet', BTC_PAYMENT), /^[0-9a-f]+$/)
+})
+
+test('the output policy runs BEFORE anything is signed — a refused sweep produces no signature', () => {
+  // The ordering `signing.ts` promises. Asserted by construction: the PSBT handed in is unchanged
+  // after the refusal, so nothing was written into it on the way out.
+  const before = psbt({ outputs: [foreignPayment.output!] })
+  try {
+    signBitcoin(btcKey.toWIF(), before, btcPayment.address!, 'testnet', BTC_SWEEP)
+    assert.fail('expected a refusal')
+  } catch (err) {
+    assert.ok(err instanceof SignRefused)
+  }
+  const reparsed = bitcoin.Psbt.fromBase64(before, { network: btcNetwork })
+  assert.equal(reparsed.data.inputs[0]?.partialSig, undefined)
 })
 
 /* ------------------------------------------------------------------ XRP */

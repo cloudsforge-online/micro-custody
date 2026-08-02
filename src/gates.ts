@@ -19,7 +19,7 @@
  */
 
 import { isEvmFamily, expectedEvmChainId, type KeyNetwork } from './chains.ts'
-import type { EvmShape } from './signing.ts'
+import type { BitcoinPolicy, EvmShape, SolanaPolicy } from './signing.ts'
 
 /**
  * Purposes /sign will act on.
@@ -53,25 +53,69 @@ export function evmShapeForPurpose(purpose: string): EvmShape {
   return EVM_SHAPE_FOR_PURPOSE[purpose] ?? 'creation'
 }
 
+/** The one Solana shape each signable purpose may produce. See `SolanaPolicy` in signing.ts. */
+const SOLANA_SHAPE_FOR_PURPOSE: Readonly<Record<string, SolanaPolicy['shape']>> = Object.freeze({
+  deployer: 'mint',
+  treasury: 'transfer',
+  deposit: 'sweep',
+})
+
+/**
+ * The Solana shape, including the fallback, as one testable answer.
+ *
+ * The fallback is 'sweep', which reads like the WIDER choice and is in fact the narrowest available
+ * here: a sweep must name the pinned destination, and `keys.ts` resolves a pin only for
+ * `purpose = 'deposit'`. So an unforeseen purpose reaching this fallback is handed an empty pin and
+ * `signSolana` refuses it outright — the fallback can sign NOTHING. 'mint' would not have that
+ * property: `createAccount` can park up to 50,000,000 lamports in an account nothing in this estate
+ * can recover, so failing toward it would be failing toward a shape that still moves money.
+ */
+export function solanaShapeForPurpose(purpose: string): SolanaPolicy['shape'] {
+  return SOLANA_SHAPE_FOR_PURPOSE[purpose] ?? 'sweep'
+}
+
+/** The one Bitcoin shape each signable purpose may produce. See `BitcoinPolicy` in signing.ts. */
+const BITCOIN_SHAPE_FOR_PURPOSE: Readonly<Record<string, BitcoinPolicy['shape']>> = Object.freeze({
+  deployer: 'payment',
+  treasury: 'payment',
+  deposit: 'sweep',
+})
+
+/**
+ * The Bitcoin shape, including the fallback, as one testable answer.
+ *
+ * Only `deposit` gets the pinned one; a `treasury` pays a user's withdrawal to an address the user
+ * supplied, and a `deployer` has no meaning on Bitcoin at all but is a signable purpose, so it gets
+ * the same shape a treasury does rather than a special case nobody would maintain.
+ *
+ * The fallback is 'sweep' for `solanaShapeForPurpose`'s reason: with no pin resolved for a
+ * non-deposit purpose, it signs nothing at all.
+ */
+export function bitcoinShapeForPurpose(purpose: string): BitcoinPolicy['shape'] {
+  return BITCOIN_SHAPE_FOR_PURPOSE[purpose] ?? 'sweep'
+}
+
 /**
  * Families in which a `deposit` address is signable AT ALL — that is, families where a
- * pinned-destination shape exists.
+ * pinned-destination shape EXISTS AND IS BUILT.
  *
- * This gate is load-bearing. Admitting `deposit` to `SIGNABLE_PURPOSES` widens what a deposit key
- * may sign in EVERY family at once, not just the ones that gained a sweep shape:
+ * **This is an allowlist and it stays one even though it now names every family custody holds keys
+ * for.** It reads as vacuous and it is not: `SIGNABLE_PURPOSES` contains `deposit`, so the day a
+ * sixth family is added to `chains.ts` its deposit addresses become signable the moment
+ * `keys.ts` learns to dispatch them — with whatever shape that family's signer happens to offer,
+ * which for a new signer is usually "whatever the caller asked for". Listing the families whose
+ * sweep shape has actually been WRITTEN is what makes that a refusal instead.
  *
- *   solana  — `signSolana` has no transfer shape, so nothing can be swept; but it DOES permit the
- *             SPL mint-creation set, and `createAccount` can park up to 50,000,000 lamports in a
- *             mint account that nothing in this estate can recover.
- *   bitcoin — `signBitcoin` spends this address's own outputs to ANY destination the PSBT names.
- *             Correct for a treasury; for a customer deposit address it is the exact hole the
- *             deposit rule exists to plug.
- *
- * Both output policies are specified in `signing.ts` and neither is built, because neither has a
- * caller. Until one does, a deposit address in those families is refused here — before the binding
- * comparison, before chain-id resolution, before any pin lookup and before anything is decrypted.
+ * The history, because the entries earn their place differently. `evm`, `ember` and `xrp` were here
+ * from the start. `bitcoin` and `solana` were refused because their sweep output policies were
+ * specified in `signing.ts` and not built — the fail-closed half of "specified, not built". They are
+ * built now (`BitcoinPolicy`, `SolanaPolicy`), and the property this gate was standing in for has
+ * moved to where it belongs: for Bitcoin, every PSBT output must pay the pinned treasury; for
+ * Solana, the single Transfer's destination must be it. In both cases the destination is chosen by
+ * the VAULT, from `custody_treasuries`, keyed by the ROW's own chain and network, and never read
+ * from the sign request.
  */
-const SWEEPABLE_FAMILIES: ReadonlySet<string> = new Set(['evm', 'ember', 'xrp'])
+const SWEEPABLE_FAMILIES: ReadonlySet<string> = new Set(['evm', 'ember', 'xrp', 'bitcoin', 'solana'])
 
 /** Just enough of a stored row to decide whether /sign may proceed at all. */
 export interface RowIdentity {

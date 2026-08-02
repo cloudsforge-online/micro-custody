@@ -336,10 +336,13 @@ const SYSTEM_PROGRAM_ID = '11111111111111111111111111111111'
 const TOKEN_PROGRAM_ID = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA'
 const ASSOCIATED_TOKEN_PROGRAM_ID = 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL'
 
-// SystemProgram instruction tag: u32 little-endian at offset 0. 0 = CreateAccount. (1 = Assign,
-// 2 = Transfer, 3 = CreateAccountWithSeed, 4 = AdvanceNonceAccount — none of which any caller in
-// this estate emits, all of which move or reassign what the address holds.)
+// SystemProgram instruction tag: u32 little-endian at offset 0. 0 = CreateAccount, 2 = Transfer.
+// (1 = Assign, 3 = CreateAccountWithSeed, 4 = AdvanceNonceAccount — none of which any caller in
+// this estate emits, all of which reassign what the address holds or move it by a second route.)
 const SYSTEM_IX_CREATE_ACCOUNT = 0
+const SYSTEM_IX_TRANSFER = 2
+/** Transfer's data is exactly the u32 tag and a u64 lamports. A longer one is not a Transfer. */
+const SYSTEM_TRANSFER_LEN = 12
 const SYSTEM_CREATE_ACCOUNT_LEN = 52
 // SPL Token instruction tag: one byte at offset 0.
 const TOKEN_IX_MINT_TO = 7
@@ -354,29 +357,58 @@ const MAX_CREATE_ACCOUNT_LAMPORTS = 50_000_000n
 const MAX_SOLANA_INSTRUCTIONS = 8
 
 /**
+ * Which Solana transaction an address of a given purpose may produce. The same split as `EvmShape`,
+ * built to the specification that used to sit in this docstring as "specified, not built".
+ *
+ *   deployer → 'mint'.     The SPL mint-creation instruction set, byte for byte as it always was.
+ *   treasury → 'transfer'. Exactly one System Transfer, to an address the caller names.
+ *   deposit  → 'sweep'.    Exactly one System Transfer, to the address THIS SERVICE pinned.
+ *
+ * THE THREE ARE DISJOINT, WHICH IS A NARROWING AS WELL AS A WIDENING. Before this existed, EVERY
+ * signable purpose got the mint-creation set, treasury included — `createAccount` can park up to
+ * 50,000,000 lamports in an account nothing in this estate can recover, and the only caller that
+ * ever needed it (`mint`, via `families.ts`) mints under `purpose: 'deployer'`. A treasury address
+ * now signs transfers and nothing else, and a deployer address still cannot move a lamport by
+ * Transfer. Neither the program allowlist nor the SPL tag allowlist is widened by any of this, so
+ * the `approve` test is still passed by the allowlists that were already here.
+ *
+ * A union rather than an optional pin, and a REQUIRED parameter, for the reason `XrpPolicy` gives:
+ * `shape: 'sweep'` without a pin must not compile, and a new call site must state which shape it
+ * means rather than inherit the widest one by default.
+ */
+export type SolanaPolicy =
+  | { readonly shape: 'mint' }
+  | { readonly shape: 'transfer' }
+  | { readonly shape: 'sweep'; readonly treasuryPin: string }
+
+/**
  * Solana: add the payer signature to a base64 transaction → fully-signed base64 transaction.
  *
- * The instruction ALLOWLIST is the policy: createAccount (as an SPL mint account only),
- * initializeMint2, mintTo, and associated-token-account creation. SD-09 names what it must refuse
- * and this is where that happens — Transfer, Approve, SetAuthority, Burn and CloseAccount are every
- * way to move or reassign what the address holds, and none of them is signable here.
+ * The instruction ALLOWLIST is the policy. For `mint` it is createAccount (as an SPL mint account
+ * only), initializeMint2, mintTo, and associated-token-account creation. SD-09 names what it must
+ * refuse and this is where that happens — Approve, SetAuthority, Burn and CloseAccount are every
+ * way to reassign what the address holds, and none of them is signable under any shape here.
  *
- * SOL HAS NO TRANSFER SHAPE, AND THEREFORE NO SWEEP. Specified here, not built. When SOL
- * withdrawals are wanted the shape has the same structure as `EvmPolicy`: `deployer` keeps the
- * instruction set below byte for byte; `treasury` permits exactly one System Transfer (tag 2,
- * 12-byte data) with `keys[0]` the vault address, `keys[1]` unconstrained and no other instruction
- * in the transaction; `deposit` is the same with `keys[1]` required to equal the pinned SOL
- * treasury. It does not widen the program allowlist and does not touch the SPL tag allowlist, so
- * the `approve` test is passed by the allowlists that already exist.
+ * SPL Transfer (tag 3) IS STILL REFUSED EVERYWHERE, and that is not an oversight now that SOL
+ * moves. `transfer` and `sweep` admit exactly ONE instruction, the SYSTEM program's Transfer, which
+ * moves native lamports out of the vault address itself. SPL Transfer moves somebody's token
+ * balance out of a token account, has a different risk and has no caller in this estate; it does
+ * not come along for the ride.
  *
- * WHAT IS LOAD-BEARING UNTIL THEN: a `deposit`-purpose SOL address must never reach this function.
- * `purposeGate` refuses it (`SWEEPABLE_FAMILIES`). Without that gate, admitting `deposit` would
- * hand a signing credential the instruction set below over every customer's SOL deposit key —
- * createAccount can park up to 50,000,000 lamports in a mint account that nothing in this estate
- * can ever recover. That is a silent re-opening of the "unconstrained signing oracle" finding by
- * the back door.
+ * WHAT CARRIES THE SAFETY PROPERTY FOR A DEPOSIT ADDRESS. It used to be `purposeGate`, which
+ * refused a `deposit`-purpose SOL address outright because there was no shape whose destination
+ * this service chose. It is now the `sweep` shape's pin: `keys[1]` — the Transfer's destination —
+ * must equal the treasury pinned for the row's own (chain, network), read from `custody_treasuries`
+ * under an administrator credential and never from the sign request. The pin is why "mint a
+ * treasury of my own, sweep every deposit into it" is not three calls; see `assertSweep` for the
+ * long form of that argument, which applies here unchanged.
  */
-export function signSolana(secretKeyBase64: string, payload: unknown, address: string): string {
+export function signSolana(
+  secretKeyBase64: string,
+  payload: unknown,
+  address: string,
+  policy: SolanaPolicy,
+): string {
   if (typeof payload !== 'string') refuse('solana payload must be a base64 transaction')
   const kp = Keypair.fromSecretKey(new Uint8Array(Buffer.from(secretKeyBase64, 'base64')))
   if (kp.publicKey.toBase58() !== address) {
@@ -386,19 +418,122 @@ export function signSolana(secretKeyBase64: string, payload: unknown, address: s
   const tx = decodeSolanaTx(payload)
   if (!tx.feePayer?.equals(kp.publicKey)) refuse('solana fee payer must be the vault address')
   if (tx.instructions.length === 0) refuse('solana transaction has no instructions')
-  if (tx.instructions.length > MAX_SOLANA_INSTRUCTIONS) {
-    refuse(`solana transaction has more than ${MAX_SOLANA_INSTRUCTIONS} instructions`)
-  }
-  for (const ix of tx.instructions) {
-    const program = ix.programId.toBase58()
-    if (program === SYSTEM_PROGRAM_ID) assertCreatesMintAccount(ix, kp.publicKey)
-    else if (program === TOKEN_PROGRAM_ID) assertTokenMintInstruction(ix, kp.publicKey)
-    else if (program === ASSOCIATED_TOKEN_PROGRAM_ID) assertAtaCreation(ix, kp.publicKey)
-    else refuse(`solana program ${short(program)} is not one this service signs for`)
+
+  if (policy.shape === 'mint') {
+    // The mint shape legitimately needs a SECOND signer: `createAccount`'s new account signs for its
+    // own creation, and the caller pre-signs with that keypair. That is why `partialSign` is used
+    // here at all, and why the signer count is only constrained on the transfer shapes below.
+    if (tx.instructions.length > MAX_SOLANA_INSTRUCTIONS) {
+      refuse(`solana transaction has more than ${MAX_SOLANA_INSTRUCTIONS} instructions`)
+    }
+    for (const ix of tx.instructions) {
+      const program = ix.programId.toBase58()
+      if (program === SYSTEM_PROGRAM_ID) assertCreatesMintAccount(ix, kp.publicKey)
+      else if (program === TOKEN_PROGRAM_ID) assertTokenMintInstruction(ix, kp.publicKey)
+      else if (program === ASSOCIATED_TOKEN_PROGRAM_ID) assertAtaCreation(ix, kp.publicKey)
+      else refuse(`solana program ${short(program)} is not one this service signs for`)
+    }
+  } else {
+    // EXACTLY ONE, not "at most MAX_SOLANA_INSTRUCTIONS". A batch is what makes a Solana signature
+    // dangerous: `partialSign` signs the whole message, so a second instruction riding alongside a
+    // legitimate Transfer is signed by the same signature and cannot be separated from it after the
+    // fact. The mint shape tolerates a handful because an SPL deploy is genuinely four
+    // instructions; a transfer is one, so anything more is somebody batching.
+    if (tx.instructions.length !== 1) {
+      refuse('a solana transfer must be exactly one instruction — nothing may ride alongside it')
+    }
+    const destination = assertSystemTransfer(tx.instructions[0]!, kp.publicKey)
+    if (policy.shape === 'sweep') assertSolanaSweepDestination(destination, policy.treasuryPin)
+    // EXACTLY ONE REQUIRED SIGNER, AND IT MUST BE US. A System Transfer needs the source account's
+    // signature and no other, so a message declaring a second required signer is not the transaction
+    // it claims to be — and this service must not hand back a half-signed one, which is a blob a
+    // caller can complete later with a counterparty of its choosing. It is checked HERE, as a
+    // refusal, rather than being left to `serialize()` below: `serialize()` throws a plain Error,
+    // which reaches the route as a 500 with NO AUDIT ROW, and an unaudited path is one a caller can
+    // probe in a loop without the rate limiter — which counts audit rows — ever seeing it.
+    //
+    // LAST of the three, deliberately. Every shape above it produces a more specific message for the
+    // same transaction: a `createAccount` needs its new account to sign, and a Transfer out of
+    // somebody else's account needs theirs, so both would otherwise be reported as a signer-count
+    // problem when the real fault is the instruction.
+    const signers = tx.signatures
+    if (signers.length !== 1 || !signers[0]?.publicKey.equals(kp.publicKey)) {
+      refuse('a solana transfer must require exactly one signature, and it must be the vault address')
+    }
   }
 
   tx.partialSign(kp)
+  // `serialize()` DEFAULTS ARE LOAD-BEARING AND MUST NOT BE RELAXED. `partialSign` recompiles the
+  // message from `tx.instructions` when the decoded signature count disagrees with the wire header,
+  // so the bytes returned are not necessarily the bytes inspected above. `verifySignatures: true`
+  // — the default — is what makes any such divergence fail here rather than ship. Passing
+  // `{ requireAllSignatures: false }` to quiet an error would switch that off; the signer check
+  // above is the reason no one ever needs to.
   return tx.serialize().toString('base64')
+}
+
+/**
+ * One SystemProgram Transfer out of the vault address. Returns its DESTINATION, so the caller can
+ * pin it without re-parsing.
+ *
+ * `keys[0]` is the funding account and it must be this address: the whole of rule 1 at the top of
+ * this file is that a signature only ever spends what the address it was requested for holds. A
+ * Transfer whose `keys[0]` is somebody else is a transaction this service is being asked to pay the
+ * FEE for while another account is drained — which the fee-payer check above would already catch
+ * for the common case, and which is checked here too because the two are different accounts in the
+ * instruction and only one of them is the one being spent.
+ */
+function assertSystemTransfer(ix: TransactionInstruction, payer: PublicKey): PublicKey {
+  // TYPED NON-NULL, ACTUALLY NULLABLE. `Transaction.from` resolves an instruction's program from
+  // `accountKeys[programIdIndex]` without range-checking the index, so a hand-rolled message with an
+  // out-of-range index yields `undefined` here and a bare TypeError — a 500 with no audit row —
+  // where a refusal is what belongs.
+  if (!(ix.programId instanceof PublicKey)) refuse('solana instruction names no program')
+  if (ix.programId.toBase58() !== SYSTEM_PROGRAM_ID) {
+    refuse(`solana program ${short(ix.programId.toBase58())} is not one this service signs transfers for`)
+  }
+  if (ix.data.length !== SYSTEM_TRANSFER_LEN || ix.data.readUInt32LE(0) !== SYSTEM_IX_TRANSFER) {
+    // Notably this refuses createAccount (tag 0, 52 bytes) under the transfer and sweep shapes, and
+    // Assign, CreateAccountWithSeed and AdvanceNonceAccount under all three.
+    refuse('the only system-program instruction a solana transfer signs is Transfer')
+  }
+  const from = ix.keys[0]?.pubkey
+  const to = ix.keys[1]?.pubkey
+  if (!from || !to) refuse('a solana Transfer must name a source and a destination')
+  if (!from.equals(payer)) refuse('a solana Transfer must be funded by the vault address')
+  // NO CEILING on lamports, for `assertTransfer`'s reason: a withdrawal may legitimately move the
+  // whole balance and there is no number anyone could state for the cap. Zero is refused because it
+  // is a fee burn with no effect, which no caller here means to ask for.
+  if (ix.data.readBigUInt64LE(4) === 0n) refuse('a solana Transfer of zero lamports is not signed')
+  if (to.equals(payer)) refuse('a solana Transfer to the vault address itself is not signed')
+  return to
+}
+
+/**
+ * The pinned destination. SD-09 gate 4, for Solana.
+ *
+ * Base58 is case-SENSITIVE and a `PublicKey` has one canonical encoding, so exact equality is the
+ * only comparison there is here — there is no EVM-style three-spellings problem to accommodate.
+ * The pin is compared as a decoded key rather than as a string so that a pin stored with stray
+ * whitespace refuses rather than silently never matching.
+ */
+function assertSolanaSweepDestination(destination: PublicKey, treasuryPin: string): void {
+  // The service's own value, not the caller's — a chain with no pin signs nothing at all.
+  if (typeof treasuryPin !== 'string' || treasuryPin.length === 0) {
+    refuse('no usable treasury is pinned for this address — a sweep has nowhere it may go')
+  }
+  let pinned: PublicKey
+  try {
+    pinned = new PublicKey(treasuryPin)
+  } catch {
+    refuse('no usable treasury is pinned for this address — a sweep has nowhere it may go')
+  }
+  if (!destination.equals(pinned)) {
+    refuse(
+      'a solana sweep must pay the treasury address pinned for this chain and network — ' +
+        'a sweep does not choose its own destination',
+    )
+  }
 }
 
 function decodeSolanaTx(base64Tx: string): SolanaTransaction {
@@ -449,25 +584,72 @@ function assertAtaCreation(ix: TransactionInstruction, payer: PublicKey): void {
 // ── Bitcoin ─────────────────────────────────────────────────────────────────
 
 /**
+ * Which Bitcoin PSBT an address of a given purpose may sign. The same split as `XrpPolicy`.
+ *
+ *   payment → the destination is the caller's business. A treasury paying a user's withdrawal.
+ *   sweep   → EVERY output must pay the pinned treasury. A customer deposit address, emptied.
+ *
+ * A union rather than an optional pin so a `sweep` with no pin does not compile, and a REQUIRED
+ * parameter so a new call site states which one it means. A default would have to be `'payment'`,
+ * the wider of the two.
+ */
+export type BitcoinPolicy = { readonly shape: 'payment' } | { readonly shape: 'sweep'; readonly treasuryPin: string }
+
+/**
+ * Fee-rate ceilings, in satoshis per virtual byte. Burn ceilings, not estimates — the same kind of
+ * number as `XRP_MAX_FEE_DROPS`, set far above any real fee and far below a loss worth causing.
+ *
+ * **THE SWEEP CEILING IS THE TIGHTER ONE, AND IT IS THERE BECAUSE THE PIN ALONE IS NOT ENOUGH.**
+ * Pinning the destination stops a sweep paying an attacker. It does NOT stop a sweep paying the
+ * miner: a PSBT with the customer's whole deposit on the input side and a single 546-satoshi output
+ * to the pin satisfies every rule above, and the remainder is fee. That is not theft, it is
+ * destruction, and it is available to any holder of `custody:sign:deposit` — the credential the
+ * pin was introduced to make harmless. bitcoinjs's own default of 5000 would bound it at roughly
+ * 0.005 BTC per sweep, which is not a bound worth having.
+ *
+ * 1000 is above every sustained mainnet fee rate on record — the 2023 spikes peaked around 500 —
+ * and a sweep is a background job that can simply wait for a cheaper block, so a stall here is
+ * self-healing in a way a burn is not. THE COUPLING IS DELIBERATE AND WORTH KNOWING ABOUT:
+ * `micro-settlement` bounds its own estimate at `MAX_SAT_PER_VB = 5_000`, so during an event above
+ * 1000 sat/vB it is THIS number that stops the sweep, and it stops it by refusing rather than by
+ * signing something regrettable.
+ *
+ * The payment ceiling stays at bitcoinjs's default. A `payment` spends a TREASURY, whose residual
+ * is stated in `assertSweep` and accepted as SDR-05: a holder of `custody:sign:treasury` can move
+ * treasury funds to an address a user names, so bounding what it may pay a miner bounds nothing that
+ * is not already unbounded. Tightening it would only refuse a legitimate high-fee withdrawal during
+ * congestion — a real cost for no gain, and a withdrawal, unlike a sweep, has a user waiting.
+ */
+const MAX_SWEEP_FEE_RATE = 1_000
+const MAX_PAYMENT_FEE_RATE = 5_000
+
+/**
  * Bitcoin: sign a base64 PSBT → finalised raw transaction hex.
  *
  * A PSBT rather than a raw transaction because a segwit signature commits to the VALUE of each
  * input, and only the PSBT carries it: handed a bare transaction this service would be signing
  * amounts it cannot see. Every input must be a P2WPKH output of this very address, so it can only
- * ever spend its own coins — the destination is the caller's business, the source is not.
+ * ever spend its own coins — under `payment` the destination is the caller's business, the source
+ * never is.
  *
  * SIGHASH_ALL ONLY. Anything else leaves part of the transaction unsigned and therefore editable
  * after the signature is handed back.
  *
- * BITCOIN'S SWEEP OUTPUT POLICY: specified here, not built. For a `deposit`-purpose PSBT the
- * destination stops being the caller's business exactly as it does for EVM: EVERY output must pay
- * the pinned BTC treasury for the row's (chain, network) — including any change output, since a
- * sweep leaves nothing behind — and a PSBT carrying an output to anything else is refused whole
- * rather than partially signed, because `signAllInputs` would otherwise pay for one foreign output
- * with a signature over all of them. Until that has a caller, `purposeGate` refuses a
- * `deposit`-purpose bitcoin address outright: the fail-closed half of "specified, not built".
+ * BITCOIN'S SWEEP OUTPUT POLICY, which used to be specified here and not built. For a
+ * `deposit`-purpose PSBT the destination stops being the caller's business exactly as it does for
+ * EVM: EVERY output must pay the pinned BTC treasury for the row's (chain, network) — INCLUDING ANY
+ * CHANGE OUTPUT, since a sweep leaves nothing behind — and a PSBT carrying an output to anything
+ * else is refused WHOLE rather than partially signed, because `signAllInputs` would otherwise pay
+ * for one foreign output with a signature over all of them. That last clause is why the output
+ * check runs before `signAllInputs` and not per-output inside it.
  */
-export function signBitcoin(wif: string, payload: unknown, address: string, network: KeyNetwork): string {
+export function signBitcoin(
+  wif: string,
+  payload: unknown,
+  address: string,
+  network: KeyNetwork,
+  policy: BitcoinPolicy,
+): string {
   if (typeof payload !== 'string') refuse('bitcoin payload must be a base64 PSBT')
   const net = bitcoinNetwork(network)
 
@@ -481,6 +663,7 @@ export function signBitcoin(wif: string, payload: unknown, address: string, netw
   const psbt = decodePsbt(payload, net, network)
   if (psbt.inputCount === 0) refuse('psbt has no inputs')
   if (psbt.txOutputs.length === 0) refuse('psbt has no outputs')
+  if (policy.shape === 'sweep') assertSweepOutputs(psbt, policy.treasuryPin, net)
   psbt.data.inputs.forEach((input, i) => {
     if (input.finalScriptSig || input.finalScriptWitness) refuse(`psbt input ${i} is already finalized`)
     const witnessUtxo = input.witnessUtxo
@@ -491,15 +674,70 @@ export function signBitcoin(wif: string, payload: unknown, address: string, netw
     }
   })
 
+  // The ceiling bitcoinjs would enforce inside `extractTransaction`, kept in step with the explicit
+  // check below so the library's own guard stays a live backstop rather than a stale default.
+  const ceiling = policy.shape === 'sweep' ? MAX_SWEEP_FEE_RATE : MAX_PAYMENT_FEE_RATE
+  psbt.setMaximumFeeRate(ceiling)
+
   psbt.signAllInputs(keyPair, [bitcoin.Transaction.SIGHASH_ALL])
   const valid = psbt.validateSignaturesOfAllInputs((pk, msghash, signature) =>
     ECPair.fromPublicKey(pk).verify(msghash, signature),
   )
   if (!valid) throw new Error(`bitcoin signature verification failed for ${address}`)
   psbt.finalizeAllInputs()
-  // extractTransaction's default 5000 sat/vB ceiling is left ON. A PSBT whose inputs dwarf its
-  // outputs is not a payment, it is a donation to a miner.
+
+  // CHECKED HERE RATHER THAN LEFT TO `extractTransaction`, which enforces the same number by
+  // throwing a plain Error. That would reach the route as a 500 with NO AUDIT ROW — and the rate
+  // limiter counts audit rows, so an unaudited path is one a caller can probe in a loop without ever
+  // being limited. It is the caller's PSBT that is out of bounds, so it is a refusal. `getFeeRate`
+  // also throws when the outputs exceed the inputs, which is the same kind of caller error.
+  let feeRate: number
+  try {
+    feeRate = psbt.getFeeRate()
+  } catch {
+    refuse('this psbt spends more than its inputs hold')
+  }
+  if (feeRate >= ceiling) {
+    refuse(
+      `this psbt pays ${feeRate} sat/vB in fee, above the ${ceiling} this service will sign away — ` +
+        'check its output values',
+    )
+  }
   return psbt.extractTransaction().toHex()
+}
+
+/**
+ * Every output of a sweep pays the pin. SD-09 gate 4, for Bitcoin.
+ *
+ * COMPARED AS A SCRIPT, NOT AS AN ADDRESS STRING. `txOutputs[i].address` is undefined for any
+ * output bitcoinjs cannot render as an address — an OP_RETURN, a bare multisig, a future witness
+ * version — so a string comparison would have to decide what to do about `undefined` and the safe
+ * answer is not obvious to a later reader. The output SCRIPT is defined for all of them, and
+ * comparing the bytes the pin's address encodes to is exactly the question being asked: does this
+ * output pay the treasury.
+ *
+ * The pin is turned into a script under the ROW's own network, so a mainnet address pinned against
+ * a testnet chain throws in `toOutputScript` and is refused rather than matching nothing.
+ */
+function assertSweepOutputs(psbt: bitcoin.Psbt, treasuryPin: string, net: bitcoin.Network): void {
+  // The service's own value, not the caller's — a chain with no pin signs nothing at all.
+  if (typeof treasuryPin !== 'string' || treasuryPin.length === 0) {
+    refuse('no usable treasury is pinned for this address — a sweep has nowhere it may go')
+  }
+  let pinned: Buffer
+  try {
+    pinned = bitcoin.address.toOutputScript(treasuryPin, net)
+  } catch {
+    refuse('no usable treasury is pinned for this address — a sweep has nowhere it may go')
+  }
+  psbt.txOutputs.forEach((output, i) => {
+    if (!output.script.equals(pinned)) {
+      refuse(
+        `psbt output ${i} does not pay the treasury address pinned for this chain and network — ` +
+          'every output of a sweep pays the pin, change included',
+      )
+    }
+  })
 }
 
 function decodePsbt(payload: string, net: bitcoin.Network, network: KeyNetwork): bitcoin.Psbt {

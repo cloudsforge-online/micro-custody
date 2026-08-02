@@ -9,7 +9,17 @@
 
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { bindingMatches, bindingMismatches, evmShapeForPurpose, purposeGate, resolveChainId, signScopeFor, type RowIdentity } from './gates.ts'
+import {
+  bindingMatches,
+  bindingMismatches,
+  bitcoinShapeForPurpose,
+  evmShapeForPurpose,
+  purposeGate,
+  resolveChainId,
+  signScopeFor,
+  solanaShapeForPurpose,
+  type RowIdentity,
+} from './gates.ts'
 
 const ROW: RowIdentity = {
   address: '0x1111111111111111111111111111111111111111',
@@ -37,13 +47,21 @@ test('gate 1: the three signable purposes and the one that is not', () => {
 })
 
 test('gate 1: a deposit address in a family with no sweep shape is refused before anything else', () => {
-  for (const family of ['solana', 'bitcoin']) {
+  // THE ALLOWLIST IS STILL AN ALLOWLIST, which is the whole reason the gate survives now that it
+  // names every family custody currently holds keys for. `SIGNABLE_PURPOSES` contains `deposit`, so
+  // a sixth family added to `chains.ts` would become signable the moment `keys.ts` learned to
+  // dispatch it — with whatever its signer happened to offer, which for a new signer is normally
+  // "whatever the caller asked for". This is what makes that a refusal instead, and the assertion is
+  // written against a family that does not exist precisely so it keeps meaning something.
+  for (const family of ['aptos', 'cardano', '']) {
     const gate = purposeGate({ purpose: 'deposit', family, status: 'active' })
     assert.equal(gate.ok, false, family)
     assert.match(gate.ok ? '' : gate.error, /have no sweep shape/)
   }
-  // The families that DO have one.
-  for (const family of ['evm', 'ember', 'xrp']) {
+  // The five that DO have one. `bitcoin` and `solana` were refused here until their sweep shapes
+  // were built — the property has moved into `signing.ts`, where every output of a BTC sweep and
+  // the sole destination of a SOL sweep must be the pinned treasury.
+  for (const family of ['evm', 'ember', 'xrp', 'bitcoin', 'solana']) {
     assert.equal(purposeGate({ purpose: 'deposit', family, status: 'active' }).ok, true, family)
   }
 })
@@ -64,6 +82,24 @@ test('the EVM shape is chosen by purpose, and the unreachable fallback is the na
   // Unreachable — `purposeGate` excluded it — and 'creation' because a creation cannot move value.
   // Deliberately not 'sweep', which despite its pinned destination still moves money.
   assert.equal(evmShapeForPurpose('something-new'), 'creation')
+})
+
+test('the Solana and Bitcoin shapes are chosen by purpose, and their fallback can sign NOTHING', () => {
+  assert.equal(solanaShapeForPurpose('deployer'), 'mint')
+  assert.equal(solanaShapeForPurpose('treasury'), 'transfer')
+  assert.equal(solanaShapeForPurpose('deposit'), 'sweep')
+
+  assert.equal(bitcoinShapeForPurpose('deployer'), 'payment')
+  assert.equal(bitcoinShapeForPurpose('treasury'), 'payment')
+  assert.equal(bitcoinShapeForPurpose('deposit'), 'sweep')
+
+  // 'sweep' reads like the WIDER fallback and is the narrowest one available. `keys.ts` resolves a
+  // treasury pin only for `purpose = 'deposit'`, so an unforeseen purpose reaching this fallback is
+  // handed an EMPTY pin, and both signers refuse an empty pin outright — see the two
+  // 'no usable treasury is pinned' cases in signing.test.ts. The fallback therefore signs nothing.
+  // 'mint' and 'payment' would both still move money.
+  assert.equal(solanaShapeForPurpose('something-new'), 'sweep')
+  assert.equal(bitcoinShapeForPurpose('something-new'), 'sweep')
 })
 
 /* ------------------------------------------------------------------ gate 2 */
