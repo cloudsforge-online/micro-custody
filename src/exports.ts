@@ -270,7 +270,11 @@ export async function requestExport(deps: ExportDeps, input: RequestExportInput)
     // the fact undeniable and delivered exactly once, which is what the outbox is for.
     emit({
       topic: 'custody.export.requested',
-      key: row.address,
+      // The USER, not the address. The registry says `keyedBy: 'user_id'` for this topic
+      // (contracts/packages/events/src/index.ts:372) and activity/src/classify.ts:634 reads the
+      // envelope key as the user id, so an address here filed every export request against a user
+      // that does not exist. The address is still in the payload, where it belongs.
+      key: input.userId,
       payload: {
         exportId: created.id,
         address: row.address,
@@ -418,17 +422,50 @@ export async function redeemExport(
     if (!spent) return { value: null }
     const transitioned = await markExported(tx, row.address)
     if (!transitioned) return { value: null }
+    /*
+     * `custody.key.exported`, and the name is the fix rather than a preference.
+     *
+     * This emit said `custody.export.completed` — a name in no registry, with no subscriber
+     * anywhere in the estate — while `custody.key.exported` is registered to this service, marked
+     * `audited: true`, and classified by notify (critical, "a notification the user may not opt out
+     * of"), activity and analytics. So the one moment this ceremony exists to announce announced
+     * itself to nobody. See `topics.ts` for the whole argument and for why the rename went this way
+     * round rather than the other.
+     *
+     * WHAT THE PAYLOAD CARRIES: that an export happened, which wallet, in which format, and the
+     * ceremony it belongs to. Enough for a user to recognise it, and for `notify` to key and
+     * address the notification.
+     *
+     * WHAT IT DELIBERATELY OMITS, and this is a security property rather than tidiness. An event is
+     * delivered over signed HTTP to every subscriber and stored in an outbox table, a delivery
+     * table and each consumer's inbox — five places that are not the vault. So it carries nothing
+     * that helps anyone repeat the export:
+     *
+     *   - `material` — the key itself. It is returned to the caller once and written nowhere; that
+     *     is gate 8, and an event is a place.
+     *   - the reveal token, and its SHA-256. The token is the one secret in the estate that yields
+     *     a private key, and the hash is what a redemption is compared against.
+     *   - `seed_id`, the vault slot behind a `mnemonic` export, and `derivation_path`. Neither is a
+     *     secret on its own; both narrow the search for one, and no consumer has ever asked for
+     *     them. The HTTP response carries the derivation path because the user restoring a phrase
+     *     needs it — a response goes to one authenticated user, an event goes to subscribers.
+     *   - the passphrase a keystore was wrapped with.
+     *
+     * SD-16's response-body scan (`bodyscan.test.ts`) is the same rule for routes, and it stays the
+     * estate's only implementation. `exports.test.ts` asserts the outbox half: no row this ceremony
+     * writes may contain the material or the token.
+     */
     emit({
-      topic: 'custody.export.completed',
-      key: row.address,
+      topic: 'custody.key.exported',
+      // Keyed by the user, per the registry (`keyedBy: 'user_id'`, index.ts:379). notify's
+      // `userIdOf` and activity's `userFromKey` both read the key as the subject for this topic.
+      key: row.user_id,
       payload: {
         exportId: row.id,
         address: row.address,
         userId: row.user_id,
         format,
         severity: 'critical',
-        // The material is NOT in the event. An event is delivered over HTTP to subscribers and
-        // stored in an outbox table; putting a key in one would defeat every other control here.
       },
       actor: `user:${input.userId}`,
       correlationId: input.correlationId,
@@ -507,7 +544,9 @@ export async function cancelExport(
     if (!updated) return { value: null }
     emit({
       topic: 'custody.export.cancelled',
-      key: row.address,
+      // Keyed like the request it closes, so a user's ceremony events order together. Unregistered
+      // — `topics.ts` records the spec that would register it.
+      key: row.user_id,
       payload: { exportId: row.id, address: row.address, userId: row.user_id, severity: 'critical' },
       actor: input.actor,
       correlationId: input.correlationId,

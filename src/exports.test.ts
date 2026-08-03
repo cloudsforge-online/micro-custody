@@ -505,19 +505,63 @@ test('an already-exported wallet cannot be exported again', { skip }, async () =
 
 /* ------------------------------------------------------------------ the audit trail */
 
-test('GATE 10: request, cancel and completion each emit an event, and none carries the material', { skip }, async () => {
+test('GATE 10: a completed export announces itself on the topic the estate reads', { skip }, async () => {
   const address = await mintFor()
   const { id, revealToken } = await toChallenged(address, 'raw')
   const redeemed = await redeemExport(h.exports, { id, userId: ALICE, revealToken, correlationId: 'c' })
   assert.equal(redeemed.ok, true)
   if (!redeemed.ok) return
 
-  const events = await sql`select topic, payload::text as payload from outbox where topic like 'custody.export.%'`
-  assert.deepEqual(events.map((e) => e.topic).sort(), ['custody.export.completed', 'custody.export.requested'])
-  for (const event of events) {
-    // An event is delivered over HTTP to subscribers and stored in a table. A key in one would
-    // defeat every other control in this file.
-    assert.equal(String(event.payload).includes(redeemed.value.material), false)
-    assert.equal(String(event.payload).includes(revealToken), false)
+  const ceremony = await sql<{ topic: string; key: string; payload: string }[]>`
+    select topic, key, payload::text as payload
+      from outbox
+     where topic in ('custody.export.requested', 'custody.key.exported', 'custody.export.completed')
+     order by topic
+  `
+  /*
+   * `custody.key.exported`, not `custody.export.completed`.
+   *
+   * This is the regression pin for the defect micro-org's estate check found: the registry names
+   * `custody.key.exported` with producer `custody`, notify holds a CRITICAL rule on it, activity
+   * and analytics classify it — and this service emitted a name nothing in the estate subscribes
+   * to, so a private key could leave the platform and reach no consumer at all. Asserting the exact
+   * set rather than "contains" is deliberate: re-adding the old name alongside would double-notify.
+   */
+  assert.deepEqual(
+    ceremony.map((e) => e.topic),
+    ['custody.export.requested', 'custody.key.exported'],
+  )
+
+  // Keyed by the USER, because the registry says `keyedBy: 'user_id'` for both and both consumers
+  // read the envelope key as the subject. An address here is an activity feed filed against a user
+  // that does not exist.
+  for (const event of ceremony) {
+    assert.equal(event.key, ALICE, `${event.topic} must be keyed by the user, not by ${event.key}`)
+  }
+
+  // No row this ceremony writes may carry the material, the reveal token or its hash. An event is
+  // delivered over HTTP to subscribers and stored in an outbox table, a delivery table and every
+  // consumer's inbox — five places that are not the vault.
+  const forbidden = [redeemed.value.material, revealToken, hashToken(revealToken)]
+  const everything = await sql<{ topic: string; payload: string }[]>`
+    select topic, payload::text as payload from outbox
+  `
+  assert.ok(everything.length >= 3, 'the scan must have rows to scan')
+  for (const event of everything) {
+    for (const secret of forbidden) {
+      assert.equal(
+        event.payload.includes(secret),
+        false,
+        `${event.topic} carries a secret from the export ceremony`,
+      )
+    }
+  }
+  // And nothing that narrows the search for one, named rather than merely absent so that a payload
+  // that grows a field has to argue with this list.
+  for (const event of ceremony) {
+    const payload = JSON.parse(event.payload) as Record<string, unknown>
+    for (const key of ['material', 'revealToken', 'reveal_token', 'tokenHash', 'token_hash', 'seedId', 'seed_id', 'derivationPath', 'derivation_path', 'passphrase']) {
+      assert.equal(Object.hasOwn(payload, key), false, `${event.topic} carries ${key}`)
+    }
   }
 })

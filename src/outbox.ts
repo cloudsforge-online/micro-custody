@@ -22,15 +22,31 @@ import type { Sql, TransactionSql } from 'postgres'
 import { HttpClient } from '@cloudsforge/http'
 import type { Logger } from '@cloudsforge/telemetry'
 import type { Handler } from '@cloudsforge/jobs'
+import type { CustodyTopic } from './topics.ts'
 
 export type Db = Sql
 export type Tx = TransactionSql
 
 /** What a caller emits. The envelope's `id`, `occurredAt` and `producer` are added here. */
 export interface DomainEvent {
-  /** `<service>.<aggregate>.<past-tense-verb>` — `custody.key.signed`. */
-  readonly topic: string
-  /** Ordering is per `(topic, key)` only. Choose the aggregate id, never a timestamp. */
+  /**
+   * `<service>.<aggregate>.<past-tense-verb>` — `custody.key.signed`.
+   *
+   * A UNION, not `string`, and that is the whole of the compile-time half of `topics.ts`. This was
+   * `string`, so this service could emit any name it liked and nothing anywhere would notice; it
+   * did, and `custody.key.exported` — registered, classified by three consumers, critical in
+   * notify — was emitted under the invented name `custody.export.completed` for the whole life of
+   * the service. A misspelled or invented topic is now a type error at the emit site.
+   */
+  readonly topic: CustodyTopic
+  /**
+   * Ordering is per `(topic, key)` only. Choose the aggregate id, never a timestamp.
+   *
+   * For a REGISTERED topic this is not a free choice: `TopicSpec.keyedBy` is part of the contract,
+   * and `notify/src/catalogue.ts:124` and `activity/src/classify.ts` both read the envelope key AS
+   * the subject when the registry says a topic is keyed by `user_id`. `topics.ts` records what each
+   * topic here is keyed by, and why.
+   */
   readonly key: string
   readonly payload: Record<string, unknown>
   readonly actor?: string
