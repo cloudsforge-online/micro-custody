@@ -3,6 +3,8 @@
 Key custody for CloudsForge: HD seeds, key generation, the encryption envelope, the **signing
 policy**, treasury pins, the key lifecycle and the export ceremony.
 
+Design authority: [`ecosystem/03-repository-responsibilities.md`](https://github.com/cloudsforge-online/micro-docs/blob/main/ecosystem/03-repository-responsibilities.md)
+
 It supersedes `forge-keyvault`. The signing policy is carried forward almost unchanged — SD-09 calls
 it the best-designed component in the estate — and seven named defects around it are fixed.
 
@@ -201,3 +203,10 @@ credential, from a read.
 Exactly one route can return key material — `POST /v1/exports/:id/redeem` — and
 `src/bodyscan.test.ts` drives every other route under every credential and proves none of them can
 (SD-16).
+
+---
+
+## Provenance
+
+The code in this repository was written by **Claude Opus 5** and **Claude Fable 5**, under
+human direction and review.
