@@ -1,6 +1,6 @@
 # cloudsforge-custody
 
-[![ci](https://github.com/cloudsforge-online/micro-custody/actions/workflows/ci.yml/badge.svg)](https://github.com/cloudsforge-online/micro-custody/actions/workflows/ci.yml) [![TypeScript](https://img.shields.io/badge/TypeScript-strict%20ESM-3178C6?logo=typescript&logoColor=white)](./tsconfig.base.json) [![node](https://img.shields.io/badge/node-%3E%3D22-5FA04E?logo=nodedotjs&logoColor=white)](./package.json) [![tests](https://img.shields.io/badge/tests-real%20Postgres-4169E1?logo=postgresql&logoColor=white)](./.github/workflows/ci.yml)
+[![ci](https://github.com/cloudsforge-online/micro-custody/actions/workflows/ci.yml/badge.svg)](https://github.com/cloudsforge-online/micro-custody/actions/workflows/ci.yml) [![TypeScript](https://img.shields.io/badge/TypeScript-strict%20ESM-3178C6?logo=typescript&logoColor=white)](./tsconfig.base.json) [![node](https://img.shields.io/badge/node-%3E%3D22-5FA04E?logo=nodedotjs&logoColor=white)](./package.json) [![tests](https://img.shields.io/badge/tests-real%20Postgres-4169E1?logo=postgresql&logoColor=white)](./.github/workflows/ci.yml) [![licence](https://img.shields.io/badge/licence-MIT-blue)](./LICENSE)
 
 Key custody for CloudsForge: HD seeds, key generation, the encryption envelope, the **signing
 policy**, treasury pins, the key lifecycle and the export ceremony.
