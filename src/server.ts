@@ -284,6 +284,23 @@ async function handle(
   }
 }
 
+/**
+ * The route table as data: every route this server will match, in declaration order.
+ *
+ * **This exists so that `bodyscan.test.ts` cannot be wrong about the surface it covers.** SD-16's
+ * response-body scan claims to drive every route; it used to claim that against a list typed out by
+ * hand, which meant a route added here was a route the scan silently stopped covering — and two of
+ * them were, for as long as it took someone to read the two files side by side. The scan now
+ * reconciles its samples against this function and fails naming any route it cannot drive.
+ *
+ * Derived from `buildRoutes()` rather than written beside it, so the two cannot disagree. Only the
+ * method and path are published: a handler is not something a test has any business calling
+ * directly, since half of what the scan asserts is a property of the transport.
+ */
+export function routeTable(): ReadonlyArray<{ readonly method: string; readonly path: string }> {
+  return buildRoutes().map((route) => ({ method: route.method, path: route.path }))
+}
+
 function buildRoutes(): Route[] {
   return [
     {
