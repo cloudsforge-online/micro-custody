@@ -59,6 +59,9 @@ const creationTx = (overrides: Record<string, unknown> = {}) => ({
   ...overrides,
 })
 
+/** No token registered. The default for every chain until an administrator registers one. */
+const NO_TOKENS: ReadonlySet<string> = new Set<string>()
+
 async function refusal(fn: () => Promise<unknown>): Promise<string> {
   try {
     await fn()
@@ -70,14 +73,14 @@ async function refusal(fn: () => Promise<unknown>): Promise<string> {
 }
 
 test('EVM: a treasury key signs a plain transfer', async () => {
-  const signed = await signEvm(evmWallet.privateKey, transferTx(), { chainId: CHAIN_ID, shape: 'transfer' })
+  const { signedTx: signed } = await signEvm(evmWallet.privateKey, transferTx(), { chainId: CHAIN_ID, shape: 'transfer' })
   const parsed = ethers.Transaction.from(signed)
   assert.equal(parsed.from, evmWallet.address)
   assert.equal(parsed.chainId, BigInt(CHAIN_ID))
 })
 
 test('EVM: a deployer key signs a zero-value creation', async () => {
-  const signed = await signEvm(evmWallet.privateKey, creationTx(), { chainId: CHAIN_ID, shape: 'creation' })
+  const { signedTx: signed } = await signEvm(evmWallet.privateKey, creationTx(), { chainId: CHAIN_ID, shape: 'creation' })
   assert.equal(ethers.Transaction.from(signed).to, null)
 })
 
@@ -89,6 +92,7 @@ test('SD-09 §1 — a DEPOSIT key attempting a TRANSFER is refused', async () =>
       chainId: CHAIN_ID,
       shape: 'sweep',
       treasuryPin: TREASURY,
+      tokenAllowlist: NO_TOKENS,
     }),
   )
   assert.match(message, /a sweep does not choose its own destination/)
@@ -110,6 +114,7 @@ test('SD-09 §4 — a sweep to an UNPINNED address is refused', async () => {
       chainId: CHAIN_ID,
       shape: 'sweep',
       treasuryPin: TREASURY,
+      tokenAllowlist: NO_TOKENS,
     }),
   )
   assert.match(message, /must be the treasury address pinned/)
@@ -117,16 +122,17 @@ test('SD-09 §4 — a sweep to an UNPINNED address is refused', async () => {
 
 test('SD-09 §4 — a sweep with NO pin at all is refused, not defaulted', async () => {
   const message = await refusal(() =>
-    signEvm(evmWallet.privateKey, transferTx(), { chainId: CHAIN_ID, shape: 'sweep', treasuryPin: '' }),
+    signEvm(evmWallet.privateKey, transferTx(), { chainId: CHAIN_ID, shape: 'sweep', treasuryPin: '', tokenAllowlist: NO_TOKENS }),
   )
   assert.match(message, /no usable treasury is pinned/)
 })
 
 test('a sweep TO the pin is signed, and that is the only destination there is', async () => {
-  const signed = await signEvm(evmWallet.privateKey, transferTx({ to: TREASURY }), {
+  const { signedTx: signed } = await signEvm(evmWallet.privateKey, transferTx({ to: TREASURY }), {
     chainId: CHAIN_ID,
     shape: 'sweep',
     treasuryPin: TREASURY,
+    tokenAllowlist: NO_TOKENS,
   })
   assert.equal(ethers.Transaction.from(signed).to, TREASURY)
 })
@@ -137,6 +143,7 @@ test('a sweep naming the pin in a different case gets its own, actionable refusa
       chainId: CHAIN_ID,
       shape: 'sweep',
       treasuryPin: TREASURY,
+      tokenAllowlist: NO_TOKENS,
     }),
   )
   assert.match(message, /different case/)
@@ -145,14 +152,33 @@ test('a sweep naming the pin in a different case gets its own, actionable refusa
 test("the `approve` test: calldata on a transfer is refused, so /sign is not a signing oracle", async () => {
   // `approve(attacker, 2^256-1)` is `to != null`, `value = 0` and 68 bytes of calldata — it passes
   // every other check in the file. Empty calldata is what makes this a policy rather than an oracle.
+  //
+  // WHY THE TWO SHAPES NOW REFUSE IT FOR DIFFERENT REASONS, which is the thing to understand about
+  // this test rather than a weakening of it. `transfer` still refuses ALL calldata, unchanged. A
+  // `sweep` payload carrying calldata is no longer a malformed sweep — it is dispatched to
+  // `token_sweep`, which refuses this one twice over: `TREASURY` is not a registered token
+  // contract, and `approve` is not the `transfer` selector. The test asserts each rule against the
+  // shape that actually owns it, because a single expected message across both would now be
+  // asserting that one of the two shapes does something it does not.
   const approve = `0x095ea7b3${'0'.repeat(24)}${STRANGER.slice(2)}${'f'.repeat(64)}`
-  for (const shape of ['transfer', 'sweep'] as const) {
-    const policy = shape === 'sweep' ? { chainId: CHAIN_ID, shape, treasuryPin: TREASURY } : { chainId: CHAIN_ID, shape }
-    const message = await refusal(() =>
-      signEvm(evmWallet.privateKey, transferTx({ to: TREASURY, data: approve }), policy),
-    )
-    assert.match(message, /`data` must be empty/)
-  }
+
+  const onTransfer = await refusal(() =>
+    signEvm(evmWallet.privateKey, transferTx({ to: TREASURY, data: approve }), {
+      chainId: CHAIN_ID,
+      shape: 'transfer',
+    }),
+  )
+  assert.match(onTransfer, /`data` must be empty/)
+
+  const onSweep = await refusal(() =>
+    signEvm(evmWallet.privateKey, transferTx({ to: TREASURY, data: approve }), {
+      chainId: CHAIN_ID,
+      shape: 'sweep',
+      treasuryPin: TREASURY,
+      tokenAllowlist: NO_TOKENS,
+    }),
+  )
+  assert.match(onSweep, /not a token contract registered/)
 })
 
 test('an unknown EVM field is refused — an unexpected field is a signature nobody asked for', async () => {
@@ -203,7 +229,7 @@ test('ember is legacy-only: an EIP-1559 transaction for it is bytes its node can
 })
 
 test('an 18-decimal value arrives as a string and is exact; a lossy number is refused', async () => {
-  const signed = await signEvm(evmWallet.privateKey, transferTx({ value: '1000000000000000000' }), {
+  const { signedTx: signed } = await signEvm(evmWallet.privateKey, transferTx({ value: '1000000000000000000' }), {
     chainId: CHAIN_ID,
     shape: 'transfer',
   })
@@ -770,4 +796,192 @@ test('XRP: a sweep with no pin is refused rather than defaulted', () => {
     () => signXrp(xrpWallet.seed!, payment(), xrpWallet.classicAddress, { shape: 'sweep', treasuryPin: '' }),
     (err: unknown) => err instanceof SignRefused && /no usable treasury is pinned/.test((err as Error).message),
   )
+})
+
+/* ------------------------------------------------ EVM: the token sweep (§5.2) */
+
+const USDT = '0xdac17f958d2ee523a2206206994597c13d831ec7'
+const TOKENS: ReadonlySet<string> = new Set([USDT])
+
+/** An ERC-20 `transfer(to, amount)`, hand-encoded so a test never shares a bug with the decoder. */
+function erc20Transfer(to: string, amount: bigint): string {
+  const addressWord = `${'0'.repeat(24)}${to.slice(2).toLowerCase()}`
+  return `0xa9059cbb${addressWord}${amount.toString(16).padStart(64, '0')}`
+}
+
+const tokenSweepTx = (overrides: Record<string, unknown> = {}) => ({
+  to: USDT,
+  data: erc20Transfer(TREASURY, 5_000_000n),
+  value: 0,
+  nonce: 0,
+  gasLimit: 100_000,
+  chainId: CHAIN_ID,
+  maxFeePerGas: '20000000000',
+  maxPriorityFeePerGas: '1000000000',
+  ...overrides,
+})
+
+const tokenSweepPolicy = (tokens: ReadonlySet<string> = TOKENS) =>
+  ({ chainId: CHAIN_ID, shape: 'sweep', treasuryPin: TREASURY, tokenAllowlist: tokens }) as const
+
+test('the selector this file admits really is `transfer(address,uint256)`', () => {
+  // The constant in signing.ts is written as a literal so a reader can see it. This is the check
+  // that the literal is the right four bytes — a typo in it would otherwise admit some other
+  // function under the name `transfer`, which is the one mistake nothing else here could catch.
+  assert.equal(ethers.id('transfer(address,uint256)').slice(0, 10), '0xa9059cbb')
+})
+
+test('a token sweep paying the pin is signed, and records itself as `token_sweep`', async () => {
+  const { signedTx, shape } = await signEvm(evmWallet.privateKey, tokenSweepTx(), tokenSweepPolicy())
+  const parsed = ethers.Transaction.from(signedTx)
+  // The transaction goes to the TOKEN, not the treasury — which is why `assertSweep`'s pin could
+  // never have expressed this and a second shape had to exist.
+  assert.equal(parsed.to?.toLowerCase(), USDT)
+  assert.equal(parsed.value, 0n)
+  // The audit column must say which policy ran. 'sweep' here would be a true statement about the
+  // purpose and a false one about the transaction.
+  assert.equal(shape, 'token_sweep')
+})
+
+test('SD-09 §4, inside the calldata — a token sweep paying a STRANGER is refused', async () => {
+  // The whole point of the shape. The recipient is 32 bytes into the calldata rather than in `to`,
+  // so this is the transaction `assertSweep`'s pin cannot see and would have waved through if the
+  // empty-calldata rule had merely been relaxed.
+  const message = await refusal(() =>
+    signEvm(evmWallet.privateKey, tokenSweepTx({ data: erc20Transfer(STRANGER, 5_000_000n) }), tokenSweepPolicy()),
+  )
+  assert.match(message, /a sweep does not choose its own destination/)
+})
+
+test('an UNREGISTERED token contract is refused — the allowlist refuses by default', async () => {
+  const rogue = ethers.Wallet.createRandom().address
+  const message = await refusal(() =>
+    signEvm(evmWallet.privateKey, tokenSweepTx({ to: rogue }), tokenSweepPolicy()),
+  )
+  assert.match(message, /not a token contract registered/)
+})
+
+test('an EMPTY allowlist makes the token sweep unreachable, which is every chain by default', async () => {
+  const message = await refusal(() => signEvm(evmWallet.privateKey, tokenSweepTx(), tokenSweepPolicy(NO_TOKENS)))
+  assert.match(message, /not a token contract registered/)
+})
+
+test('the allowlist is not case-sensitive theatre: a checksummed `to` still resolves', async () => {
+  // The table stores one lower-cased spelling (schema CHECK) and the shape lower-cases the
+  // candidate. A caller sending EIP-55 casing must therefore be admitted, not refused for cosmetics.
+  const { shape } = await signEvm(
+    evmWallet.privateKey,
+    tokenSweepTx({ to: ethers.getAddress(USDT) }),
+    tokenSweepPolicy(),
+  )
+  assert.equal(shape, 'token_sweep')
+})
+
+test('ON a registered token, every function except `transfer` is still refused', async () => {
+  // The allowlist bounds WHICH CONTRACT; the selector bounds WHICH FUNCTION. Both are needed:
+  // `approve(attacker, max)` and `transferFrom(victim, attacker, all)` on a legitimately registered
+  // USDT are the two calls that turn a deposit key into a signing oracle, and neither is stopped by
+  // the allowlist alone.
+  for (const selector of ['095ea7b3', '23b872dd']) {
+    const data = `0x${selector}${'0'.repeat(24)}${TREASURY.slice(2).toLowerCase()}${'f'.repeat(64)}`
+    const message = await refusal(() => signEvm(evmWallet.privateKey, tokenSweepTx({ data }), tokenSweepPolicy()))
+    assert.match(message, /must call `transfer\(address,uint256\)`/)
+  }
+})
+
+test('calldata with anything appended to it is refused, not truncated', async () => {
+  // A decoder would read the first two words and ignore the tail. The signature covers the tail,
+  // and a token contract with a fallback may not ignore it, so the exact byte length is the rule.
+  const message = await refusal(() =>
+    signEvm(evmWallet.privateKey, tokenSweepTx({ data: `${erc20Transfer(TREASURY, 1n)}deadbeef` }), tokenSweepPolicy()),
+  )
+  assert.match(message, /exactly 68 bytes/)
+})
+
+test('a dirty left pad on the recipient word is refused rather than masked off', async () => {
+  // A token contract reads the low 20 bytes, so these high bytes change nothing on-chain — which is
+  // exactly why they would be here: to make the calldata read differently from what executes.
+  const dirty = `0xa9059cbb${'0'.repeat(22)}ff${TREASURY.slice(2).toLowerCase()}${'1'.repeat(64)}`
+  const message = await refusal(() => signEvm(evmWallet.privateKey, tokenSweepTx({ data: dirty }), tokenSweepPolicy()))
+  assert.match(message, /not a left-padded 20-byte address/)
+})
+
+test('native value alongside a token sweep is refused — it would be burnt at the contract', async () => {
+  const message = await refusal(() =>
+    signEvm(evmWallet.privateKey, tokenSweepTx({ value: '1000000000000000' }), tokenSweepPolicy()),
+  )
+  assert.match(message, /`value` must be zero on a token sweep/)
+})
+
+test('a zero-amount token sweep is refused — a signature is permanent and this one moves nothing', async () => {
+  const message = await refusal(() =>
+    signEvm(evmWallet.privateKey, tokenSweepTx({ data: erc20Transfer(TREASURY, 0n) }), tokenSweepPolicy()),
+  )
+  assert.match(message, /must transfer a positive amount/)
+})
+
+test('a token sweep with no pinned treasury is refused, not defaulted', async () => {
+  const message = await refusal(() =>
+    signEvm(evmWallet.privateKey, tokenSweepTx(), {
+      chainId: CHAIN_ID,
+      shape: 'sweep',
+      treasuryPin: '',
+      tokenAllowlist: TOKENS,
+    }),
+  )
+  assert.match(message, /no usable treasury is pinned/)
+})
+
+test('the NATIVE sweep is not widened by any of this — calldata to the pin is still not a sweep', async () => {
+  // The regression that would matter most. `assertSweep` must still refuse calldata; a payload that
+  // carries some is now a TOKEN sweep and is held to the token rules, so `to: TREASURY` fails the
+  // allowlist. Either way there is no path on which a deposit key executes caller-chosen calldata.
+  const message = await refusal(() =>
+    signEvm(evmWallet.privateKey, transferTx({ to: TREASURY, data: '0xdeadbeef' }), tokenSweepPolicy()),
+  )
+  assert.match(message, /not a token contract registered/)
+})
+
+test('`BigInt` is not a parser: a whitespace-only quantity is refused, not read as zero', async () => {
+  // `BigInt('  ')` is `0n`. `quantity`'s `length > 0` guard passes a whitespace string straight
+  // through, so before `parseBigInt` trimmed, a blank `gasLimit` became a zero one.
+  const message = await refusal(() =>
+    signEvm(evmWallet.privateKey, transferTx({ value: '   ' }), { chainId: CHAIN_ID, shape: 'transfer' }),
+  )
+  assert.match(message, /`value` is not a non-negative quantity/)
+})
+
+test('§5.2 the gas problem: funding a deposit address is ALREADY signable, with no new shape', async () => {
+  // An ERC-20 arrives at a deposit address holding zero ETH, so the token cannot be swept until
+  // somebody puts gas there. The reflex is to invent a `gas_topup` shape. Nothing is needed: the
+  // top-up is a plain native transfer FROM THE TREASURY, whose destination the caller names, and
+  // that is exactly the `transfer` shape the treasury already has.
+  //
+  // The asymmetry is the point and it is what keeps this safe. The treasury's transfer already
+  // permits any destination — SDR-05, stated in `assertTransfer` — so pointing one at a deposit
+  // address adds no capability whatsoever. Solving it in the other direction (letting the DEPOSIT
+  // key pull gas, or widening its shape) would have added one.
+  const depositAddress = ethers.Wallet.createRandom().address
+  const { signedTx, shape } = await signEvm(
+    evmWallet.privateKey,
+    transferTx({ to: depositAddress, value: '2100000000000000' }),
+    { chainId: CHAIN_ID, shape: 'transfer' },
+  )
+  assert.equal(shape, 'transfer')
+  assert.equal(ethers.Transaction.from(signedTx).to, depositAddress)
+})
+
+test('§5.2 the gas problem: the DEPOSIT key still cannot move native value to fund itself', async () => {
+  // The other half, asserted so the pair reads as a decision rather than an accident. Gas flows
+  // treasury → deposit and never deposit → anywhere-but-the-pin, so the top-up cannot be turned
+  // around into a withdrawal path.
+  const message = await refusal(() =>
+    signEvm(evmWallet.privateKey, transferTx({ to: STRANGER }), {
+      chainId: CHAIN_ID,
+      shape: 'sweep',
+      treasuryPin: TREASURY,
+      tokenAllowlist: TOKENS,
+    }),
+  )
+  assert.match(message, /a sweep does not choose its own destination/)
 })

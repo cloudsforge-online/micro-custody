@@ -347,6 +347,46 @@ export async function getTreasuryPin(sql: Db | Tx, chain: string, network: strin
   return rows[0]?.address ?? null
 }
 
+export interface TokenContractRow {
+  readonly chain: string
+  readonly network: string
+  readonly contract: string
+  readonly symbol: string
+  readonly decimals: number
+}
+
+/**
+ * The ERC-20 contracts an operator registered for one (chain, network), lower-cased.
+ *
+ * **Empty is the correct answer for every unconfigured chain and it is not an error.** With an
+ * empty set `token_sweep` refuses every candidate, so a chain nobody has registered a token on
+ * signs native sweeps and nothing else — which is what custody did before the shape existed.
+ *
+ * Read by the ROW's own chain and network, never by anything the caller sent, for the same reason
+ * `getTreasuryPin` is: a token registered on one network must be invisible on every other.
+ * `custody_token_contracts_contract_ck` guarantees the stored spelling is already lower-case, so
+ * this set can be compared against a lower-cased candidate without normalising on the way out.
+ */
+export async function getTokenAllowlist(
+  sql: Db | Tx,
+  chain: string,
+  network: string,
+): Promise<ReadonlySet<string>> {
+  const rows = await sql<{ contract: string }[]>`
+    select contract from custody_token_contracts
+    where chain = ${chain} and network = ${network}
+  `
+  return new Set(rows.map((row) => row.contract))
+}
+
+export async function listTokenContracts(sql: Db): Promise<TokenContractRow[]> {
+  return sql<TokenContractRow[]>`
+    select chain, network, contract, symbol, decimals
+    from custody_token_contracts
+    order by chain, network, contract
+  `
+}
+
 export async function listTreasuryPins(sql: Db): Promise<TreasuryPinRecord[]> {
   const rows = await sql<TreasuryRow[]>`select * from custody_treasuries order by chain, network`
   return rows.map(toPinRecord)

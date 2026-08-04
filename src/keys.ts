@@ -36,6 +36,7 @@ import {
   findKeyByIdempotencyKey,
   getKey,
   getTreasuryPin,
+  getTokenAllowlist,
   insertKey,
   insertSeed,
   insertSigningAudit,
@@ -444,6 +445,12 @@ export async function signForAddress(deps: KeyDeps, request: SignRequest): Promi
   }
   const payloadDigest = digestOf(request.payload)
   const shape = shapeForRow(row.family, row.purpose)
+  // The shape a SUCCESSFUL sign actually went through. It starts as the row-derived one and is
+  // replaced by what `signEvm` reports, because a `deposit` payload carrying calldata is a
+  // `token_sweep` and only the signer knows that. Refusals keep the row-derived value: a request
+  // refused at a gate never reached a shape, and naming one it did not reach would be a guess in
+  // the column a dispute reads first.
+  let appliedShape: string = shape
 
   const refused = async (status: number, code: string, gate: string, error: string): Promise<SignOutcome> => {
     await auditOnly(deps, {
@@ -494,7 +501,11 @@ export async function signForAddress(deps: KeyDeps, request: SignRequest): Promi
   // by the ROW's own chain and network, so a deposit address on ethereum testnet can only ever pay
   // the ethereum-testnet treasury.
   let treasuryPin = ''
+  // Empty for every purpose except `deposit`, and empty for a deposit chain with no registered
+  // token. An empty allowlist makes `token_sweep` unreachable rather than unbounded.
+  let tokenAllowlist: ReadonlySet<string> = EMPTY_ALLOWLIST
   if (row.purpose === 'deposit') {
+    tokenAllowlist = await getTokenAllowlist(deps.sql, row.chain, network)
     const pinned = await getTreasuryPin(deps.sql, row.chain, network)
     if (!pinned) {
       return refused(
@@ -513,11 +524,14 @@ export async function signForAddress(deps: KeyDeps, request: SignRequest): Promi
 
   let signedTx: string
   try {
-    signedTx = await produceSignature(row, privateKey, request.payload, {
+    const produced = await produceSignature(row, privateKey, request.payload, {
       chainId: chainId.chainId,
       network,
       treasuryPin,
+      tokenAllowlist,
     })
+    signedTx = produced.signedTx
+    appliedShape = produced.shape
   } catch (err) {
     if (err instanceof SignRefused) {
       // A refusal is the caller's fault and is safe to describe: every message is built from
@@ -548,7 +562,7 @@ export async function signForAddress(deps: KeyDeps, request: SignRequest): Promi
       network: row.network,
       family: row.family,
       purpose: row.purpose,
-      shape,
+      shape: appliedShape,
       outcome: 'signed',
       gate: null,
       refusalReason: null,
@@ -568,7 +582,7 @@ export async function signForAddress(deps: KeyDeps, request: SignRequest): Promi
         chain: row.chain,
         network: row.network,
         purpose: row.purpose,
-        shape,
+        shape: appliedShape,
         payloadDigest,
       },
       actor: request.actor,
@@ -611,6 +625,20 @@ function rowIdentity(row: CustodyKeyRow): RowIdentity {
 }
 
 /**
+ * The allowlist a non-deposit purpose gets: nothing.
+ *
+ * Frozen and shared rather than allocated per request, and named rather than written inline as
+ * `new Set()`, so that every read of the sign path sees the same word for "no token is callable
+ * here" and nobody has to work out whether an empty set was intended or forgotten.
+ */
+const EMPTY_ALLOWLIST: ReadonlySet<string> = new Set<string>()
+
+/** A non-EVM signer returns bytes only; its shape is the row-derived one and does not need refining. */
+async function wrap(shape: string, signing: string | Promise<string>): Promise<{ signedTx: string; shape: string }> {
+  return { signedTx: await signing, shape }
+}
+
+/**
  * Dispatch on the ROW, never on what the caller said.
  *
  * The two are already known to agree — the binding check ran — and the row is the one this service
@@ -620,8 +648,13 @@ async function produceSignature(
   row: CustodyKeyRow,
   privateKey: string,
   payload: unknown,
-  ctx: { chainId: number; network: KeyNetwork; treasuryPin: string },
-): Promise<string> {
+  ctx: {
+    chainId: number
+    network: KeyNetwork
+    treasuryPin: string
+    tokenAllowlist: ReadonlySet<string>
+  },
+): Promise<{ signedTx: string; shape: string }> {
   switch (row.family) {
     case 'evm':
     case 'ember': {
@@ -632,7 +665,13 @@ async function produceSignature(
       // one anyway, because a compile-time argument is not a check.
       const policy: EvmPolicy =
         shape === 'sweep'
-          ? { chainId: ctx.chainId, shape, treasuryPin: ctx.treasuryPin, legacyOnly: row.family === 'ember' }
+          ? {
+              chainId: ctx.chainId,
+              shape,
+              treasuryPin: ctx.treasuryPin,
+              tokenAllowlist: ctx.tokenAllowlist,
+              legacyOnly: row.family === 'ember',
+            }
           : { chainId: ctx.chainId, shape, legacyOnly: row.family === 'ember' }
       return signEvm(privateKey, payload, policy)
     }
@@ -641,19 +680,25 @@ async function produceSignature(
       // A union member, not an object with an optional pin, for `EvmPolicy`'s reason: a 'sweep' with
       // no pin must not compile.
       const policy: SolanaPolicy = shape === 'sweep' ? { shape, treasuryPin: ctx.treasuryPin } : { shape }
-      return signSolana(privateKey, payload, row.address, policy)
+      return wrap(shape, signSolana(privateKey, payload, row.address, policy))
     }
     case 'bitcoin': {
       const shape = bitcoinShapeForPurpose(row.purpose)
       const policy: BitcoinPolicy = shape === 'sweep' ? { shape, treasuryPin: ctx.treasuryPin } : { shape }
-      return signBitcoin(privateKey, payload, row.address, ctx.network, policy)
+      return wrap(shape, signBitcoin(privateKey, payload, row.address, ctx.network, policy))
     }
     case 'xrp':
-      return signXrp(
-        privateKey,
-        payload,
-        row.address,
-        row.purpose === 'deposit' ? { shape: 'sweep', treasuryPin: ctx.treasuryPin } : { shape: 'payment' },
+      // `shapeForRow` deliberately records the FAMILY name for XRP rather than a policy shape,
+      // because signXrp takes its shape from an inline purpose comparison and inventing a mapping
+      // here to feed the audit column would be a second place that mapping lives. Preserved.
+      return wrap(
+        shapeForRow(row.family, row.purpose),
+        signXrp(
+          privateKey,
+          payload,
+          row.address,
+          row.purpose === 'deposit' ? { shape: 'sweep', treasuryPin: ctx.treasuryPin } : { shape: 'payment' },
+        ),
       )
     default:
       throw new Error(`no signer for family '${row.family}'`)

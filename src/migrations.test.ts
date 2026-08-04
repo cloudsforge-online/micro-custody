@@ -165,3 +165,77 @@ test('a signing audit row must be one of exactly two outcomes', { skip }, async 
     /signing_audit_outcome_ck/,
   )
 })
+
+test('the token allowlist stores ONE spelling of a contract, and the schema is what says so', { skip }, async () => {
+  // The invariant the whole `token_sweep` allowlist rests on. `signing.ts` lower-cases the
+  // candidate before asking, so a checksummed row in this table would be a row that can never match
+  // — an entry an operator adds, sees accepted, and which silently never authorises anything.
+  await assert.rejects(
+    () => sql`
+      insert into custody_token_contracts (chain, network, contract, symbol, decimals, set_by)
+      values ('ethereum', 'mainnet', '0xdAC17F958D2ee523a2206206994597C13D831ec7', 'USDT', 6, 'test')
+    `,
+    /custody_token_contracts_contract_ck/,
+  )
+  // Nor a string that is merely lower-case without being an address.
+  await assert.rejects(
+    () => sql`
+      insert into custody_token_contracts (chain, network, contract, symbol, decimals, set_by)
+      values ('ethereum', 'mainnet', 'usdt', 'USDT', 6, 'test')
+    `,
+    /custody_token_contracts_contract_ck/,
+  )
+  // The lower-cased form is accepted, which is the half that proves the constraint is not simply
+  // rejecting everything.
+  await sql`
+    insert into custody_token_contracts (chain, network, contract, symbol, decimals, set_by)
+    values ('ethereum', 'mainnet', '0xdac17f958d2ee523a2206206994597c13d831ec7', 'USDT', 6, 'test')
+  `
+  const rows = await sql<{ contract: string }[]>`
+    select contract from custody_token_contracts where chain = 'ethereum' and network = 'mainnet'
+  `
+  assert.equal(rows.length, 1)
+  assert.equal(rows[0]?.contract, '0xdac17f958d2ee523a2206206994597c13d831ec7')
+})
+
+test('the same contract on two networks is two rows, and they cannot collide', { skip }, async () => {
+  // A brand of stablecoin is a different deployment per network, and one being registered must
+  // never make another callable. The primary key carries (chain, network) for that reason.
+  const usdc = '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48'
+  await sql`
+    insert into custody_token_contracts (chain, network, contract, symbol, decimals, set_by)
+    values ('ethereum', 'mainnet', ${usdc}, 'USDC', 6, 'test'),
+           ('ethereum', 'testnet', ${usdc}, 'USDC', 6, 'test')
+  `
+  await assert.rejects(
+    () => sql`
+      insert into custody_token_contracts (chain, network, contract, symbol, decimals, set_by)
+      values ('ethereum', 'mainnet', ${usdc}, 'USDC', 6, 'test')
+    `,
+    /custody_token_contracts_pkey/,
+  )
+  const mainnet = await sql<{ contract: string }[]>`
+    select contract from custody_token_contracts
+    where chain = 'ethereum' and network = 'mainnet' and contract = ${usdc}
+  `
+  assert.equal(mainnet.length, 1, 'a network-scoped lookup must not see the other network\'s row')
+})
+
+test('a stablecoin registered with absurd decimals is refused at write time', { skip }, async () => {
+  // Decimals are the field whose error is worth 10^12. The band does not make an operator right,
+  // but it refuses the values that cannot be right at the moment they are typed.
+  await assert.rejects(
+    () => sql`
+      insert into custody_token_contracts (chain, network, contract, symbol, decimals, set_by)
+      values ('ethereum', 'mainnet', '0x0000000000000000000000000000000000000001', 'X', 99, 'test')
+    `,
+    /custody_token_contracts_decimals_ck/,
+  )
+  await assert.rejects(
+    () => sql`
+      insert into custody_token_contracts (chain, network, contract, symbol, decimals, set_by)
+      values ('ethereum', 'testnet', '0x0000000000000000000000000000000000000002', '', 6, 'test')
+    `,
+    /custody_token_contracts_symbol_ck/,
+  )
+})

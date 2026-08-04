@@ -347,6 +347,74 @@ export const MIGRATIONS: readonly Migration[] = [
         where purpose in ('deposit', 'deployer');
     `,
   },
+  {
+    version: 7,
+    name: 'token_contracts',
+    /*
+     * THE TOKEN ALLOWLIST — WHICH CONTRACTS A DEPOSIT KEY MAY BE MADE TO CALL.
+     *
+     * `token_sweep` (signing.ts) is the only shape in this service whose `tx.to` is a CONTRACT
+     * rather than an address this service minted. Its recipient is pinned inside the calldata, so
+     * the money cannot go anywhere but the treasury; what this table bounds is the other half —
+     * WHICH CODE a customer's deposit key is allowed to execute. An unbounded version admits
+     * `transfer` on an attacker-deployed contract that does something else entirely under that
+     * name, which is a signing oracle wearing an ERC-20's clothes.
+     *
+     * IT REFUSES BY DEFAULT AND STARTS EMPTY. No token is sweepable until an administrator inserts
+     * it. A chain with no row here signs native sweeps and nothing else, which is exactly the
+     * behaviour before this migration — so deploying it changes no existing capability.
+     *
+     * THE ADDRESS IS STORED LOWER-CASE AND THE CHECK ENFORCES IT, which is the invariant that makes
+     * the allowlist an allowlist. EVM addresses have three valid spellings; if two of them could
+     * coexist in this table, then "is this contract registered" would depend on how the caller
+     * happened to type it, and a lookup miss on a checksummed spelling fails OPEN in the worst
+     * possible direction — it would refuse a legitimate sweep, an operator would "fix" it by
+     * inserting the other spelling, and the table would then contain two rows an audit has to
+     * reconcile by eye. One spelling, enforced by the database, and `signing.ts` lower-cases the
+     * candidate before asking.
+     *
+     * `decimals` IS RECORDED BUT NOT USED BY THIS SERVICE, and that is on purpose. Custody signs;
+     * it does not denominate. The column exists because an operator registering a token has to have
+     * looked the value up, and a registry that does not record what the operator believed cannot
+     * later be checked against the contract — which is the check that catches a six-decimal
+     * stablecoin credited as an eighteen-decimal one, an error of 10^12.
+     *
+     * WHY (chain, network) IS PART OF THE KEY. The same brand of stablecoin is a different contract
+     * on every chain, and one of them being registered must never make the others callable. The
+     * lookup in `keys.ts` is by the ROW's own chain and network, the same source as the treasury
+     * pin, so a token registered on ethereum mainnet is invisible to an address on any other.
+     */
+    up: `
+      create table if not exists custody_token_contracts (
+        chain    text        not null,
+        network  text        not null,
+        contract text        not null,
+        symbol   text        not null,
+        decimals smallint    not null,
+        set_by   text        not null,
+        set_at   timestamptz not null default now(),
+        primary key (chain, network, contract),
+
+        -- One spelling per contract, and it is the lower-cased one. See the note above.
+        constraint custody_token_contracts_contract_ck
+          check (contract = lower(contract) and contract ~ '^0x[0-9a-f]{40}$'),
+
+        -- ERC-20 permits any uint8. The band is wide enough for every real token and narrow enough
+        -- that a transposed or defaulted value is refused rather than stored.
+        constraint custody_token_contracts_decimals_ck
+          check (decimals between 0 and 36),
+
+        constraint custody_token_contracts_symbol_ck
+          check (length(symbol) between 1 and 32),
+
+        -- A token sweep is an EVM shape and nothing else has one. A row on a Bitcoin chain would be
+        -- unreachable by any code path, so it is a mistake rather than a future feature, and the
+        -- place to catch a mistake is where it is written.
+        constraint custody_token_contracts_network_ck
+          check (network in ('mainnet', 'testnet'))
+      );
+    `,
+  },
 ]
 
 /**

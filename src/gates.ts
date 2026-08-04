@@ -19,7 +19,7 @@
  */
 
 import { isEvmFamily, expectedEvmChainId, type KeyNetwork } from './chains.ts'
-import type { BitcoinPolicy, EvmShape, SolanaPolicy } from './signing.ts'
+import type { BitcoinPolicy, EvmPurposeShape, SolanaPolicy } from './signing.ts'
 
 /**
  * Purposes /sign will act on.
@@ -31,11 +31,48 @@ import type { BitcoinPolicy, EvmShape, SolanaPolicy } from './signing.ts'
  * `user` is NOT present. A user-purpose wallet exists so the customer can hold and export it; the
  * platform signs nothing on their behalf, and giving it a shape would make custody a signing oracle
  * for keys whose owner never asked it to sign anything.
+ *
+ * ## Re-examined when native BTC/ETH/USDT/LTC deposits were built, and DELIBERATELY LEFT ALONE
+ *
+ * The multi-asset on-ramp was read as needing `user` here, on the argument that a customer who
+ * deposits BTC and converts it cannot then place a bet, because staking needs a signature and there
+ * is no key the platform will sign with. The argument is real and the conclusion does not follow.
+ *
+ * FIRST, THE ON-RAMP DOES NOT DEPEND ON IT. Money arrives at a `deposit`-purpose address, which is
+ * already signable, and leaves by a sweep whose destination this service pins. Nothing on the
+ * deposit → confirm → credit → sweep path touches a `user` key. Widening this set buys the on-ramp
+ * exactly nothing; the thing it would buy is downstream of it.
+ *
+ * SECOND, THE SHAPE COULD NOT BE CONSTRAINED THE WAY THE OTHERS ARE. Every shape in this file is
+ * safe because the VAULT chooses the beneficiary — a creation has none, a sweep's is the pin, and a
+ * token sweep's is the pin one ABI word deeper. A stake is a call to a contract address the caller
+ * names, with calldata the caller composes. There is no field left for this service to pin. The
+ * honest description of `user → 'contract_call'` is "sign what you are given with a customer's
+ * key", and that is the definition this file exists to refuse, whatever allowlist is bolted to it.
+ *
+ * THIRD, THERE IS A ROUTE THAT NEEDS NO USER KEY. A custodial stake is placed from a PLATFORM
+ * address and each user's share is a ledger entry — which is what "custodial" already means
+ * everywhere else in this estate. That route needs a `treasury` signature, which is already
+ * signable, and it needs a disclosure rather than a new signing capability. It is a wallet and
+ * foresight change and it is out of custody's hands, which is the correct place for it to be.
+ *
+ * So: a widening here would have been a permanent, total-loss-shaped change to the one service
+ * where that is unrecoverable, bought to avoid a disclosure and a ledger entry in two services that
+ * are not this one. `user` stays out. If it is ever revisited, the question to answer first is
+ * "which field of the transaction does the VAULT choose", and if the answer is "none", the answer
+ * to the widening is also none.
  */
 const SIGNABLE_PURPOSES: ReadonlySet<string> = new Set(['deployer', 'treasury', 'deposit'])
 
-/** The one EVM shape each signable purpose may produce. See `EvmPolicy` in signing.ts. */
-const EVM_SHAPE_FOR_PURPOSE: Readonly<Record<string, EvmShape>> = Object.freeze({
+/**
+ * The one EVM shape each signable purpose may SELECT. See `EvmPolicy` in signing.ts.
+ *
+ * `deposit → 'sweep'` is still one entry even though a deposit address can now produce two shapes.
+ * `token_sweep` is refined out of `sweep` by the payload inside `signEvm` and is not selectable
+ * from here — hence `EvmPurposeShape`, which does not contain it. A purpose still picks a policy;
+ * the policy now happens to admit two disjoint transactions, both paying the same pinned treasury.
+ */
+const EVM_SHAPE_FOR_PURPOSE: Readonly<Record<string, EvmPurposeShape>> = Object.freeze({
   deployer: 'creation',
   treasury: 'transfer',
   deposit: 'sweep',
@@ -49,7 +86,7 @@ const EVM_SHAPE_FOR_PURPOSE: Readonly<Record<string, EvmShape>> = Object.freeze(
  * unforeseen purpose fails toward the shape that cannot spend the balance. Deliberately not
  * 'sweep', which despite its pinned destination still moves money.
  */
-export function evmShapeForPurpose(purpose: string): EvmShape {
+export function evmShapeForPurpose(purpose: string): EvmPurposeShape {
   return EVM_SHAPE_FOR_PURPOSE[purpose] ?? 'creation'
 }
 

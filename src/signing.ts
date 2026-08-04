@@ -59,7 +59,18 @@ function onlyFields(obj: Record<string, unknown>, allowed: ReadonlySet<string>, 
   }
 }
 
+/**
+ * `BigInt` is not a parser and must not be used as one without this guard.
+ *
+ * `BigInt('')` is `0n` and so is `BigInt('   ')` — it does not throw, it treats an empty or
+ * whitespace-only string as zero. The `length > 0` check in `quantity` catches the first spelling
+ * and not the second, so a `value` of `'  '` used to arrive here and leave as a perfectly good
+ * zero. Today every shape that permits a zero requires one, so nothing is exploitable; the reason
+ * to fix it anyway is that "a field the caller left blank silently means zero" is a property no
+ * future shape should have to know it is inheriting.
+ */
 function parseBigInt(value: string): bigint | null {
+  if (value.trim().length === 0) return null
   try {
     return BigInt(value)
   } catch {
@@ -120,21 +131,55 @@ const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000'
 /**
  * The one EVM transaction shape an address of a given purpose may produce. SD-09 gate 1.
  *
- *   deployer → 'creation'. A zero-value contract creation with bounded initcode, and nothing else.
- *   treasury → 'transfer'. The platform's payout address, and nothing else.
- *   deposit  → 'sweep'.    A transfer whose destination THIS SERVICE chooses.
+ *   deployer → 'creation'.     A zero-value contract creation with bounded initcode, and nothing else.
+ *   treasury → 'transfer'.     The platform's payout address, and nothing else.
+ *   deposit  → 'sweep' or 'token_sweep'. A movement whose RECIPIENT THIS SERVICE CHOOSES.
  *
- * The three shapes are disjoint and no address holds two of them. That is what makes `purpose`
- * load-bearing rather than cosmetic labelling: it selects a signing policy, so mislabelling an
- * address is a refusal, not a wider signature.
+ * The shapes are disjoint and no address holds two of them **except `deposit`, which holds the two
+ * sweeps** — and that exception is the subject of the next paragraph, because it is the one place
+ * this file's original rule was widened.
  *
  * WHY THE CREATION RULE IS NOT SIMPLY RELAXED. "to must be null, value must be zero" was once the
  * whole EVM policy, and it is also the reason no EVM coin could ever leave the platform — a
  * withdrawal is `to != null` with `value > 0`, precisely the shape that rule forbids. The fix is
  * not to widen it: a deployer that can also transfer value is a deployer whose whole balance is one
  * signature away. It is to make the shape a property of what the address is FOR.
+ *
+ * ## Why `deposit` now carries two shapes, and why that is not the thing the rule forbade
+ *
+ * An ERC-20 balance at a deposit address cannot be moved by `sweep`: an ERC-20 transfer's `to` is
+ * the token CONTRACT and its real recipient lives inside the calldata, so `assertSweep`'s pin —
+ * which compares `tx.to` to the treasury — refuses it, and `assertTransfer`'s empty-calldata rule
+ * refuses it again. Both refusals are correct and neither is relaxed here. `token_sweep` is a
+ * SECOND closed shape, not a loosening of the first.
+ *
+ * The property the one-shape-per-purpose rule was protecting is not the count. It is:
+ *
+ *     **a deposit address's signature can only ever move value to the treasury this service
+ *     pinned, and the caller never names the recipient.**
+ *
+ * Both sweeps have that property; they differ only in WHERE the recipient is read from. `sweep`
+ * reads it from `tx.to`. `token_sweep` reads it from the first ABI argument of the calldata. So
+ * the union of the two admissible sets still contains no transaction whose beneficiary the caller
+ * chose, which is the only invariant that was ever load-bearing.
+ *
+ * WHICH SHAPE APPLIES IS DERIVED FROM THE PAYLOAD, NOT REQUESTED. There is deliberately no new
+ * field on the sign request naming the shape. A `deposit` payload with empty calldata is a `sweep`
+ * and one with calldata is a `token_sweep`, and each is then held to its own rules in full. A
+ * caller-supplied selector would be a caller-supplied choice between two policies, which is a
+ * smaller version of exactly the thing this file exists to refuse — and it would be a new way to be
+ * wrong for no capability in return, because the two sets are already disjoint on the payload.
  */
-export type EvmShape = 'creation' | 'transfer' | 'sweep'
+export type EvmShape = 'creation' | 'transfer' | 'sweep' | 'token_sweep'
+
+/**
+ * The shapes a PURPOSE may select. `token_sweep` is deliberately absent.
+ *
+ * It is refined out of `sweep` by the payload inside `signEvm` and is not reachable from any
+ * purpose, which is what stops `gates.ts` from ever mapping an address type onto it directly. The
+ * distinction is a type rather than a comment because a comment does not fail a build.
+ */
+export type EvmPurposeShape = Exclude<EvmShape, 'token_sweep'>
 
 interface EvmPolicyBase {
   /**
@@ -162,21 +207,59 @@ export type EvmPolicy =
       readonly shape: 'sweep'
       /** The treasury THIS SERVICE pinned for the source address's (chain, network). */
       readonly treasuryPin: string
+      /**
+       * The ERC-20 contracts an OPERATOR has registered for this (chain, network), lower-cased.
+       *
+       * Empty is the correct default and the one every chain starts at: with no registered token,
+       * `token_sweep` is unreachable and a deposit address signs native sweeps only. A token
+       * becomes sweepable when an administrator puts it in `custody_token_contracts` and never as a
+       * side effect of anything a signing caller does.
+       */
+      readonly tokenAllowlist: ReadonlySet<string>
     })
 
-/** EVM: sign an unsigned transaction object → serialised signed transaction hex. */
-export async function signEvm(privateKey: string, payload: unknown, policy: EvmPolicy): Promise<string> {
+/**
+ * EVM: sign an unsigned transaction object → the serialised signed transaction and the shape that
+ * actually admitted it.
+ *
+ * The shape is RETURNED rather than assumed by the caller because `deposit` now has two of them and
+ * only this function knows which one ran. `signing_audit.shape` has to record the policy a
+ * signature actually went through — that column exists to answer exactly that question in a dispute
+ * — and a caller that guessed 'sweep' for every deposit would be writing an audit trail that is
+ * confidently wrong about half of them.
+ */
+export async function signEvm(
+  privateKey: string,
+  payload: unknown,
+  policy: EvmPolicy,
+): Promise<{ readonly signedTx: string; readonly shape: EvmShape }> {
   const tx = asRecord(payload, 'evm payload')
   onlyFields(tx, EVM_FIELDS, 'evm payload')
 
   if (Number(tx.chainId) !== policy.chainId) refuse(`chainId must be ${policy.chainId}`)
 
-  const gasLimit =
-    policy.shape === 'creation'
-      ? assertCreation(tx)
-      : policy.shape === 'sweep'
-        ? assertSweep(tx, policy.treasuryPin)
-        : assertTransfer(tx)
+  // Which of the two sweeps a deposit payload is, decided by the payload and never by the caller.
+  // `data` absent or '0x' is a native sweep; anything else is a token sweep and is held to
+  // `assertTokenSweep` in full. Neither branch can fall through to the other: a native sweep still
+  // requires empty calldata and a token sweep still requires exactly 68 bytes of it.
+  let shape: EvmShape
+  let gasLimit: bigint
+  if (policy.shape === 'sweep') {
+    const carriesCalldata = tx.data != null && tx.data !== '0x' && tx.data !== ''
+    if (carriesCalldata) {
+      shape = 'token_sweep'
+      gasLimit = assertTokenSweep(tx, policy.treasuryPin, policy.tokenAllowlist)
+    } else {
+      shape = 'sweep'
+      gasLimit = assertSweep(tx, policy.treasuryPin)
+    }
+  } else if (policy.shape === 'creation') {
+    shape = 'creation'
+    gasLimit = assertCreation(tx)
+  } else {
+    shape = 'transfer'
+    gasLimit = assertTransfer(tx)
+  }
 
   if (!Number.isSafeInteger(tx.nonce) || (tx.nonce as number) < 0) {
     refuse('`nonce` must be a non-negative integer')
@@ -205,7 +288,7 @@ export async function signEvm(privateKey: string, payload: unknown, policy: EvmP
   }
 
   const wallet = new ethers.Wallet(privateKey)
-  return wallet.signTransaction(tx as ethers.TransactionRequest)
+  return { signedTx: await wallet.signTransaction(tx as ethers.TransactionRequest), shape }
 }
 
 /** A zero-value contract creation with bounded initcode. Returns the gas limit. */
@@ -325,6 +408,158 @@ function assertSweep(tx: Record<string, unknown>, treasuryPin: string): bigint {
   // empty calldata, positive value with no ceiling, the [21,000, 200,000] gas band and the
   // zero-address refusal. A rule that stops applying to transfers must stop applying here too.
   return assertTransfer(tx)
+}
+
+/**
+ * `transfer(address,uint256)` — the first four bytes of its keccak-256 hash.
+ *
+ * Written as a literal and CHECKED against `ethers.id` in the tests rather than computed here, so
+ * that the constant this file admits is a constant a reader can see, and a typo in it fails a test
+ * instead of silently admitting a different function. There is no `transferFrom` here and there
+ * must never be: `transferFrom(from,to,amount)` moves somebody ELSE's balance, which is not a sweep
+ * of this address and is not a thing a deposit key has any business signing.
+ */
+const ERC20_TRANSFER_SELECTOR = 'a9059cbb'
+
+/** 4-byte selector + a 32-byte address word + a 32-byte amount word. Nothing before, nothing after. */
+const ERC20_TRANSFER_CALLDATA_BYTES = 68
+
+/**
+ * An ERC-20 sweep of a customer deposit address INTO the treasury. Returns the gas limit.
+ *
+ * ## Why this shape has to exist at all
+ *
+ * A USDT transfer to a per-user deposit address succeeds — the sender pays the gas — and the
+ * platform then holds a token balance at an address whose native balance is zero. Moving it is an
+ * `transfer(address,uint256)` call sent TO THE TOKEN CONTRACT, so `tx.to` is the contract and not
+ * the treasury, and the calldata is 68 bytes rather than empty. `assertSweep` refuses it on the
+ * first count and `assertTransfer` on the second. Without this shape a token deposit is money the
+ * platform has custody of and can never move, which is worse than not accepting it.
+ *
+ * ## Where the safety comes from, since it cannot come from `tx.to`
+ *
+ * `assertSweep`'s whole security property is that the VAULT chooses the destination. That property
+ * is preserved exactly, by moving the pin from the `to` FIELD into the ABI DECODE:
+ *
+ *   * `tx.to` must be a contract an OPERATOR registered in `custody_token_contracts` for this
+ *     address's own (chain, network). It is an allowlist and it refuses by default, so the set of
+ *     contracts a deposit key can be made to call is a set no signing credential can add to.
+ *   * The calldata must be EXACTLY `transfer(<pin>, <amount>)`. The recipient word is compared to
+ *     the treasury pin, which is read from `custody_treasuries` by the row's own chain and network
+ *     and never from the request — the identical source `assertSweep` uses.
+ *   * `value` must be ZERO. Native value sent alongside a token transfer is not part of the
+ *     transfer; on most ERC-20s it reverts and on the rest it is burnt at the contract.
+ *
+ * So a caller holding `custody:sign:deposit` can make this key call `transfer` on a registered
+ * token, paying the pinned treasury, and nothing else. That is the same sentence as `assertSweep`'s
+ * with one more noun in it.
+ *
+ * ## The gas that pays for this transaction, and why no shape here provides it
+ *
+ * A deposit address that has only ever received USDT holds no ETH, so it cannot pay for the very
+ * transaction this function signs. That is the famous half of the trap and it is NOT solved here,
+ * deliberately — it is solved by the treasury sending gas to the deposit address first, which is a
+ * plain native transfer to a caller-named destination and is therefore the `transfer` shape the
+ * treasury already has. No new shape, no widening, and nothing in this file changes.
+ *
+ * The direction matters and it is the whole reason this is safe. The treasury's transfer already
+ * admits ANY destination (that is SDR-05, stated in `assertTransfer`), so aiming one at a deposit
+ * address adds no capability that a holder of `custody:sign:treasury` did not already have. Solving
+ * it the other way round — a shape letting the DEPOSIT key pull or move native value — would have
+ * created one, over a customer's key, to save a transaction.
+ *
+ * Three rules for the caller that orchestrates it, none of which this service can enforce and all
+ * of which cost money if they are missed:
+ *
+ *   1. **Fund on demand, never in advance.** Gas parked at deposit addresses is dust that must
+ *      itself be swept later, at a fee, from thousands of addresses.
+ *   2. **Fund once.** The top-up and the sweep are two transactions with a confirmation between
+ *      them; a planner that does not treat the top-up as in-flight will fund the same address on
+ *      every tick until it confirms.
+ *   3. **The leftover is not an error.** The top-up funds `gasLimit × maxFee` and the transaction
+ *      spends less, so a little native value remains at the address afterwards. It is swept by the
+ *      ordinary native path or left as dust; it is not a reconciliation break.
+ *
+ * ## Why the calldata is decoded by hand rather than by `ethers.AbiCoder`
+ *
+ * A decoder's job is to be permissive about encodings that mean the same thing; this function's job
+ * is the opposite. Non-zero bytes in an address word's twelve-byte left pad, or trailing bytes
+ * after the second word, are things a decoder may discard and a token contract may not. The
+ * comparison here is over the exact byte string that will be broadcast, so anything the signature
+ * covers is either checked or refused, and "the decoder ignored it" is never an answer.
+ */
+function assertTokenSweep(
+  tx: Record<string, unknown>,
+  treasuryPin: string,
+  tokenAllowlist: ReadonlySet<string>,
+): bigint {
+  // A fault in here rather than in the request, and it still fails CLOSED — exactly as `assertSweep`
+  // treats an unpinned chain.
+  if (typeof treasuryPin !== 'string' || !ethers.isAddress(treasuryPin)) {
+    refuse('no usable treasury is pinned for this address — a sweep has nowhere it may go')
+  }
+
+  // The token contract: an allowlist, checked before anything is decoded.
+  if (typeof tx.to !== 'string' || !ethers.isAddress(tx.to)) {
+    refuse('`to` must be the address of a registered token contract on a token sweep')
+  }
+  if (!tokenAllowlist.has(tx.to.toLowerCase())) {
+    refuse(
+      "`to` is not a token contract registered for this address's chain and network — " +
+        'an administrator must register a token before a deposit key will call it',
+    )
+  }
+
+  // Native value alongside a token transfer is never intended and is usually unrecoverable.
+  if (quantity(tx.value ?? 0, '`value`') !== 0n) refuse('`value` must be zero on a token sweep')
+
+  const data = typeof tx.data === 'string' ? tx.data : ''
+  if (!/^0x[0-9a-fA-F]+$/.test(data)) refuse('`data` must be 0x-hex calldata on a token sweep')
+  const body = data.slice(2)
+  if (body.length !== ERC20_TRANSFER_CALLDATA_BYTES * 2) {
+    refuse(
+      `\`data\` must be exactly ${ERC20_TRANSFER_CALLDATA_BYTES} bytes — ` +
+        'a `transfer(address,uint256)` call and nothing appended to it',
+    )
+  }
+  if (body.slice(0, 8).toLowerCase() !== ERC20_TRANSFER_SELECTOR) {
+    refuse('`data` must call `transfer(address,uint256)` — no other function is signable here')
+  }
+
+  // The recipient word. The twelve-byte left pad must be zero: a token contract reads the low 20
+  // bytes regardless, so dirty high bytes change nothing on-chain and would only ever be here to
+  // make this comparison read differently from what executes.
+  const recipientWord = body.slice(8, 72)
+  if (!/^0{24}[0-9a-fA-F]{40}$/.test(recipientWord)) {
+    refuse("`data`'s recipient argument is not a left-padded 20-byte address")
+  }
+  const recipient = `0x${recipientWord.slice(24).toLowerCase()}`
+
+  // THE PIN, inside the calldata. Compared lower-cased rather than character for character, which
+  // is the opposite of `assertSweep` and is right for the opposite reason: `tx.to` there is a
+  // string the caller echoed and its casing is a real EIP-55 checksum worth insisting on, whereas
+  // an ABI word has no casing at all — it is twenty raw bytes that hex-encoding has to spell
+  // somehow. Insisting on a spelling here would refuse correct calldata for a cosmetic reason.
+  if (recipient !== treasuryPin.toLowerCase()) {
+    refuse(
+      "`data` pays an address that is not the treasury pinned for this chain and network — " +
+        'a sweep does not choose its own destination',
+    )
+  }
+
+  // A signature is permanent and a zero-amount transfer is not a sweep of anything. Refusing it
+  // costs a caller nothing it wanted and removes a signed no-op from ever existing.
+  const amount = parseBigInt(`0x${body.slice(72)}`)
+  if (amount === null || amount <= 0n) refuse('`data` must transfer a positive amount')
+
+  // An ERC-20 `transfer` is 21,000 intrinsic plus roughly 14k–50k of storage work; USDT is near the
+  // top of that band. The ceiling is `transfer`'s, deliberately shared: a token sweep that wants
+  // more gas than the treasury's own transfers is not a token sweep.
+  const gasLimit = quantity(tx.gasLimit, '`gasLimit`')
+  if (gasLimit < 21_000n || gasLimit > MAX_TRANSFER_GAS) {
+    refuse(`\`gasLimit\` must be between 21000 and ${MAX_TRANSFER_GAS} for a token sweep`)
+  }
+  return gasLimit
 }
 
 // ── Solana ──────────────────────────────────────────────────────────────────
