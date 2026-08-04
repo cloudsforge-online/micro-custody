@@ -219,30 +219,31 @@ test('two assignments for one user are two addresses, so the binding is per addr
   )
 })
 
-test('THE GAP: the same idempotency key mints a SECOND address — custody does not dedupe', { skip }, async () => {
+test('THE CONTRACT: a repeated request returns the ORIGINAL address, and says it created nothing', { skip }, async () => {
   /*
-   * NOT a decoration, and not an aspiration: this is what the service does today, recorded so that
-   * the callers who believe otherwise can be corrected by a failing test rather than by a comment.
+   * THIS TEST USED TO ASSERT THE OPPOSITE, and it was right to.
    *
-   * wallet's `CreateAddressRequest.idempotencyKey` used to be documented as "Custody returns the
-   * same address for the same key rather than minting a second one", and mint's client says
-   * "Idempotent on (chain, network, userId, orderId)" (`mint/src/custodyclient.ts:124`). Neither is
-   * true. There is no idempotency handling in this service — `provisionAddress` (`keys.ts:101`)
-   * mints unconditionally — and the `idempotency-key` header is not read anywhere.
+   * Until migration 6 it read "THE GAP: the same idempotency key mints a SECOND address — custody
+   * does not dedupe", and it passed: `provisionAddress` minted unconditionally and the
+   * `idempotency-key` header was not read anywhere, while wallet's client documented "Custody
+   * returns the same address for the same key" and mint's still says "Idempotent on (chain,
+   * network, userId, orderId)" (`mint/src/custodyclient.ts:124`). Two callers believed a property
+   * this service had never had. It said of itself: "THE DAY THIS TEST STARTS FAILING IS THE DAY
+   * CUSTODY GAINED IDEMPOTENCY", and that day is what this rewrite records.
    *
-   * It is survivable only because wallet checks for an existing assignment row before it calls, so
-   * the retry that would duplicate is the one that races that check. THE DAY THIS TEST STARTS
-   * FAILING IS THE DAY CUSTODY GAINED IDEMPOTENCY, and both callers' comments become true and
-   * should be rewritten rather than the test deleted.
+   * The full behaviour — the two identities, the conflict, the concurrency — is
+   * `idempotency.test.ts`. What belongs HERE is the part a caller in another repository has to be
+   * able to rely on: the address, and the status that distinguishes a replay from a mint.
    */
   const body = { chain: 'ember', network: 'testnet', purpose: 'deposit', userId: ALICE, orderId: 'assignment-1' }
   const first = await create(body)
   const second = await create(body)
   assert.equal(first.status, 201, first.text)
-  assert.equal(second.status, 201, second.text)
-  assert.notEqual(
-    (first.body.key as Record<string, unknown>).address,
+  assert.equal(second.status, 200, 'a replay created nothing, and 201 would say it had')
+  assert.equal(second.body.reused, true)
+  assert.equal(
     (second.body.key as Record<string, unknown>).address,
-    'custody now dedupes — see the comment above; this is good news and the callers’ docs are stale',
+    (first.body.key as Record<string, unknown>).address,
+    'a retry must be given the address the first call published, not a second place money can land',
   )
 })

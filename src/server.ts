@@ -105,6 +105,8 @@ export const ADDRESS_CREATE_SCOPE = 'custody:address:create'
 export const TREASURY_READ_SCOPE = 'custody:treasury:read'
 
 const MAX_BODY_BYTES = 256 * 1024
+/** Kept equal to migration 6's `custody_keys_idempotency_ck`, so the two cannot disagree. */
+const MAX_IDEMPOTENCY_KEY_LENGTH = 255
 const SAFE_REQUEST_ID = /^[A-Za-z0-9_-]{1,64}$/
 const NETWORKS = new Set(['mainnet', 'testnet'])
 const PURPOSES = new Set<Purpose>(['deposit', 'treasury', 'deployer', 'user'])
@@ -130,6 +132,15 @@ export function registerServiceMetrics(metrics: Metrics): Metrics {
       help: 'Addresses minted, by scheme. `flat_random` must never increase for XRP.',
       kind: 'counter',
       labels: ['scheme', 'purpose'],
+    })
+    .register({
+      name: 'custody_addresses_replayed_total',
+      help:
+        'Provisioning requests answered with an address that already existed. Counted separately ' +
+        'because a replay is not a mint: this rising while `created_total` does not is a caller ' +
+        'retrying, and both rising together is a caller minting.',
+      kind: 'counter',
+      labels: ['purpose'],
     })
     .register({
       name: 'custody_rate_limited_total',
@@ -350,6 +361,10 @@ function buildRoutes(): Route[] {
         const network = enumField(body, 'network', NETWORKS, 'testnet') as KeyNetwork
         const purpose = enumField(body, 'purpose', PURPOSES as ReadonlySet<string>, 'deposit') as Purpose
         const scheme = enumField(body, 'scheme', SCHEMES as ReadonlySet<string>, 'hd_bip44') as Scheme
+        // A HEADER, not a body field, because that is where both callers put it: `@cloudsforge/http`
+        // sets `idempotency-key` from `request.idempotencyKey`, and it also RETRIES a POST that
+        // carries one. Reading it here is what makes that retry safe instead of what makes it mint.
+        const idempotencyKey = idempotencyKeyOf(ctx.req)
 
         const done = deps.lifecycle.track()
         try {
@@ -362,8 +377,16 @@ function buildRoutes(): Route[] {
             scheme,
             createdBy: actor,
             correlationId: ctx.requestId,
+            ...(idempotencyKey === undefined ? {} : { idempotencyKey }),
           })
-          if (!result.ok) return errorReply(400, result.code, result.error, ctx.requestId)
+          if (!result.ok) return errorReply(result.status, result.code, result.error, ctx.requestId)
+          if (result.reused) {
+            // 200 AND `reused`, the vocabulary the treasury mint route below already speaks. A 201
+            // here would tell a caller — and every log, metric and dashboard reading the status —
+            // that an address was created, which is the one thing that did not happen.
+            deps.metrics.increment('custody_addresses_replayed_total', { purpose })
+            return { status: 200, body: { key: result.key, reused: true } }
+          }
           deps.metrics.increment('custody_addresses_created_total', { scheme, purpose })
           // NEVER the private key. The response is the secret-free projection and nothing else.
           return { status: 201, body: { key: result.key } }
@@ -694,7 +717,7 @@ function buildRoutes(): Route[] {
           createdBy: actorOf(principal),
           correlationId: ctx.requestId,
         })
-        if (!result.ok) return errorReply(400, result.code, result.error, ctx.requestId)
+        if (!result.ok) return errorReply(result.status, result.code, result.error, ctx.requestId)
 
         ctx.log.warn('treasury candidate minted', {
           audit: 'treasury_minted',
@@ -918,4 +941,24 @@ function send(res: ServerResponse, reply: Reply, requestId: string): void {
 function headerOf(req: IncomingMessage, name: string): string | undefined {
   const value = req.headers[name]
   return Array.isArray(value) ? value[0] : value
+}
+
+/**
+ * The caller's name for this request, or nothing.
+ *
+ * An absent header and an empty one mean the same thing — no key — because a header a caller sent
+ * with nothing in it is not an identity, and treating `''` as one would make every such request
+ * "the same request" and every mint after the first a replay of the wrong address. The length cap
+ * matches migration 6's CHECK, so a key that would be refused by the database is refused here with
+ * a sentence instead of a 500.
+ */
+function idempotencyKeyOf(req: IncomingMessage): string | undefined {
+  const raw = headerOf(req, 'idempotency-key')
+  if (raw === undefined) return undefined
+  const value = raw.trim()
+  if (value.length === 0) return undefined
+  if (value.length > MAX_IDEMPOTENCY_KEY_LENGTH) {
+    throw new BadRequestError(`idempotency-key must be at most ${MAX_IDEMPOTENCY_KEY_LENGTH} characters`)
+  }
+  return value
 }

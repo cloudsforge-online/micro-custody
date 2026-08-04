@@ -450,17 +450,32 @@ function solSweepTx(from: string, to: string): string {
   return tx.serialize({ requireAllSignatures: false, verifySignatures: false }).toString('base64')
 }
 
-async function mintDepositOn(chain: string) {
-  const minted = await mint({ chain, network: 'testnet', purpose: 'deposit', userId: ALICE, orderId: 'order-1' })
+/**
+ * A DISTINCT deposit address on `chain`, every call.
+ *
+ * The counter is not decoration. This used to pass a fixed `orderId: 'order-1'`, and two calls in
+ * one case then relied on custody minting a second address for a binding it had already minted —
+ * which it did, because it had no idempotency at all. Migration 6 makes that a replay, so a fixture
+ * that wants a SECOND address now has to ask for one the way wallet does: a new assignment id per
+ * address (`wallet/src/deposits.ts:196`). The cases below need a stranger address to prove a sweep
+ * cannot pay it, and a stranger that is the same address proves nothing.
+ */
+let depositOrdinal = 0
+async function mintDepositOn(chain: string): Promise<{ address: string; orderId: string }> {
+  depositOrdinal += 1
+  const orderId = `order-${depositOrdinal}`
+  const minted = await mint({ chain, network: 'testnet', purpose: 'deposit', userId: ALICE, orderId })
   assert.equal(minted.status, 201, minted.text)
-  return (minted.body.key as Record<string, unknown>).address as string
+  // The orderId comes BACK, because it is half of what a signature is bound to and the caller now
+  // has to restate it — exactly as settlement does for a real sweep.
+  return { address: (minted.body.key as Record<string, unknown>).address as string, orderId }
 }
 
 test('§5 item 3: a BTC deposit sweeps to the PIN, and to nothing else', { skip }, async () => {
   const treasury = await mintAndPinTreasury('bitcoin', 'testnet')
-  const address = await mintDepositOn('bitcoin')
+  const { address, orderId } = await mintDepositOn('bitcoin')
   const binding = (payload: unknown) =>
-    depositBinding(address, payload, { chain: 'bitcoin', family: 'bitcoin' })
+    depositBinding(address, payload, { chain: 'bitcoin', family: 'bitcoin', orderId })
 
   const signed = await signRequest(binding(sweepPsbt(address, [treasury])))
   assert.equal(signed.status, 200, signed.text)
@@ -475,7 +490,7 @@ test('§5 item 3: a BTC deposit sweeps to the PIN, and to nothing else', { skip 
   // THE NEGATIVE, which is the one that matters. Same address, same key, same route — a destination
   // the caller chose instead of the one the vault did.
   const stranger = await mintDepositOn('bitcoin')
-  const refused = await signRequest(binding(sweepPsbt(address, [stranger])))
+  const refused = await signRequest(binding(sweepPsbt(address, [stranger.address])))
   assert.equal(refused.status, 403, refused.text)
   assert.match(errorOf(refused).message, /every output of a sweep pays the pin/)
 })
@@ -485,9 +500,13 @@ test('§5 item 3: a BTC sweep may not keep CHANGE, even paying the pin with the 
   // a change output beside a pin-paying one is signed by the same signature and cannot be separated
   // from it. A sweep leaves nothing behind.
   const treasury = await mintAndPinTreasury('bitcoin', 'testnet')
-  const address = await mintDepositOn('bitcoin')
+  const { address, orderId } = await mintDepositOn('bitcoin')
   const response = await signRequest(
-    depositBinding(address, sweepPsbt(address, [treasury, address]), { chain: 'bitcoin', family: 'bitcoin' }),
+    depositBinding(address, sweepPsbt(address, [treasury, address]), {
+      chain: 'bitcoin',
+      family: 'bitcoin',
+      orderId,
+    }),
   )
   assert.equal(response.status, 403, response.text)
   assert.match(errorOf(response).message, /change included/)
@@ -495,8 +514,9 @@ test('§5 item 3: a BTC sweep may not keep CHANGE, even paying the pin with the 
 
 test('§5 item 3: a SOL deposit sweeps to the PIN, and to nothing else', { skip }, async () => {
   const treasury = await mintAndPinTreasury('solana', 'testnet')
-  const address = await mintDepositOn('solana')
-  const binding = (payload: unknown) => depositBinding(address, payload, { chain: 'solana', family: 'solana' })
+  const { address, orderId } = await mintDepositOn('solana')
+  const binding = (payload: unknown) =>
+    depositBinding(address, payload, { chain: 'solana', family: 'solana', orderId })
 
   const signed = await signRequest(binding(solSweepTx(address, treasury)))
   assert.equal(signed.status, 200, signed.text)
@@ -505,7 +525,7 @@ test('§5 item 3: a SOL deposit sweeps to the PIN, and to nothing else', { skip 
   assert.equal(parsed.instructions.length, 1)
 
   const stranger = await mintDepositOn('solana')
-  const refused = await signRequest(binding(solSweepTx(address, stranger)))
+  const refused = await signRequest(binding(solSweepTx(address, stranger.address)))
   assert.equal(refused.status, 403, refused.text)
   assert.match(errorOf(refused).message, /a sweep does not choose its own destination/)
 })
@@ -514,9 +534,9 @@ test('§5 item 3: a BTC or SOL deposit on an UNPINNED chain signs nothing at all
   // Gate 4, before gate 5. An unconfigured chain is not "sweep to anywhere", it is a named refusal
   // reached with no private key in this process at all.
   for (const chain of ['bitcoin', 'solana']) {
-    const address = await mintDepositOn(chain)
+    const { address, orderId } = await mintDepositOn(chain)
     const payload = chain === 'bitcoin' ? sweepPsbt(address, [address]) : solSweepTx(address, address)
-    const response = await signRequest(depositBinding(address, payload, { chain, family: chain }))
+    const response = await signRequest(depositBinding(address, payload, { chain, family: chain, orderId }))
     assert.equal(response.status, 403, chain)
     assert.equal(errorOf(response).code, 'no_treasury_pinned')
     const rows = await sql`select gate from signing_audit where address = ${address}`
@@ -530,20 +550,22 @@ test('§5 item 3: a SOL DEPOSIT key still cannot createAccount — the mint set 
   // `deposit` to the signer without a shape would have handed that to any holder of
   // `custody:sign:deposit` over every customer's SOL key.
   await mintAndPinTreasury('solana', 'testnet')
-  const address = await mintDepositOn('solana')
+  const { address, orderId } = await mintDepositOn('solana')
   const payer = new PublicKey(address)
   const tx = new SolanaTransaction({ feePayer: payer, recentBlockhash: 'GHtXQBsoZHVnNFa9YevAzFr17DJjgHXk3ycTKD5xD3Zi' })
   tx.add(
     SystemProgram.createAccount({
       fromPubkey: payer,
-      newAccountPubkey: new PublicKey(await mintDepositOn('solana')),
+      newAccountPubkey: new PublicKey((await mintDepositOn('solana')).address),
       lamports: 50_000_000,
       space: 82,
       programId: new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA'),
     }),
   )
   const payload = tx.serialize({ requireAllSignatures: false, verifySignatures: false }).toString('base64')
-  const response = await signRequest(depositBinding(address, payload, { chain: 'solana', family: 'solana' }))
+  const response = await signRequest(
+    depositBinding(address, payload, { chain: 'solana', family: 'solana', orderId }),
+  )
   assert.equal(response.status, 403, response.text)
   assert.match(errorOf(response).message, /only system-program instruction a solana transfer signs is Transfer/)
 })

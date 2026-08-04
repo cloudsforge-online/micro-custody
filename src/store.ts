@@ -42,6 +42,12 @@ export interface CustodyKeyRow {
   readonly created_by: string
   readonly created_at: Date
   readonly exported_at: Date | null
+  /**
+   * What the caller called this request, or null. Never published — `toKeyRecord` does not carry
+   * it and neither does the admin projection. It is an input to a uniqueness decision, not a fact
+   * about the address, and a caller's key string is a caller's business.
+   */
+  readonly idempotency_key: string | null
 }
 
 /**
@@ -122,22 +128,80 @@ export interface InsertKey {
   readonly keyVersion: number
   readonly storage: string
   readonly createdBy: string
+  /** Absent for a caller that sent no `idempotency-key`, which is a supported way to call. */
+  readonly idempotencyKey?: string | null
 }
 
+/**
+ * Write the row that names an address.
+ *
+ * **This is where a duplicate mint becomes impossible**, and it does so by raising 23505 rather
+ * than by anything written here: migration 6's two partial unique indexes. `provisionAddress` looks
+ * first, but a lookup before an insert is a check that cannot fail in a test and cannot succeed
+ * under a race — two concurrent provisions both read an empty table. The insert is the only point
+ * at which the two are serialised, so it is the only place the invariant can live.
+ */
 export async function insertKey(sql: Db | Tx, input: InsertKey): Promise<CustodyKeyRow> {
   const rows = await sql<CustodyKeyRow[]>`
     insert into custody_keys
       (address, chain, family, purpose, network, user_id, order_id, scheme,
-       derivation_path, seed_id, key_version, storage, created_by)
+       derivation_path, seed_id, key_version, storage, created_by, idempotency_key)
     values
       (${input.address}, ${input.chain}, ${input.family}, ${input.purpose}, ${input.network},
        ${input.userId}, ${input.orderId}, ${input.scheme}, ${input.derivationPath},
-       ${input.seedId}, ${input.keyVersion}, ${input.storage}, ${input.createdBy})
+       ${input.seedId}, ${input.keyVersion}, ${input.storage}, ${input.createdBy},
+       ${input.idempotencyKey ?? null})
     returning *
   `
   const row = rows[0]
   if (!row) throw new Error('insert returned no row')
   return row
+}
+
+/**
+ * The row a caller's own idempotency key already produced, if any.
+ *
+ * Scoped to `created_by` for the same reason the index is: the key is a string the caller chose,
+ * and two services are entitled to choose the same one.
+ */
+export async function findKeyByIdempotencyKey(
+  sql: Db | Tx,
+  createdBy: string,
+  idempotencyKey: string,
+): Promise<CustodyKeyRow | null> {
+  const rows = await sql<CustodyKeyRow[]>`
+    select * from custody_keys
+     where created_by = ${createdBy} and idempotency_key = ${idempotencyKey}
+  `
+  return rows[0] ?? null
+}
+
+/**
+ * The row already holding a binding.
+ *
+ * Only ever asked about `deposit` and `deployer` — the two purposes whose `orderId` is minted once
+ * per address by the caller. Asking it about a treasury would return the address an operator is
+ * mid-rotation away from.
+ */
+export async function findKeyByBinding(
+  sql: Db | Tx,
+  binding: {
+    readonly chain: string
+    readonly network: string
+    readonly purpose: string
+    readonly userId: string
+    readonly orderId: string
+  },
+): Promise<CustodyKeyRow | null> {
+  const rows = await sql<CustodyKeyRow[]>`
+    select * from custody_keys
+     where chain = ${binding.chain}
+       and network = ${binding.network}
+       and purpose = ${binding.purpose}
+       and user_id = ${binding.userId}
+       and order_id = ${binding.orderId}
+  `
+  return rows[0] ?? null
 }
 
 export async function getKey(sql: Db | Tx, address: string): Promise<CustodyKeyRow | null> {

@@ -32,6 +32,8 @@ import {
 } from './signing.ts'
 import { withOutbox, type Db, type Tx } from './outbox.ts'
 import {
+  findKeyByBinding,
+  findKeyByIdempotencyKey,
   getKey,
   getTreasuryPin,
   insertKey,
@@ -79,30 +81,96 @@ export interface ProvisionRequest {
   readonly scheme?: Scheme
   readonly createdBy: string
   readonly correlationId: string
+  /**
+   * What the caller calls this request, from the `idempotency-key` header. Absent is supported and
+   * is not the same as "mint another one" — see `findReplay`.
+   */
+  readonly idempotencyKey?: string
 }
 
 export type ProvisionResult =
-  | { readonly ok: true; readonly key: CustodyKeyRecord }
-  | { readonly ok: false; readonly code: string; readonly error: string }
+  | {
+      readonly ok: true
+      readonly key: CustodyKeyRecord
+      /** True when nothing was created and this is the address an earlier request already got. */
+      readonly reused: boolean
+    }
+  | { readonly ok: false; readonly status: number; readonly code: string; readonly error: string }
 
 /**
- * Mint an address.
+ * The purposes whose binding names exactly one address, and may therefore be deduplicated by it.
  *
- * THE ORDER OF THE WRITES IS A CORRECTNESS PROPERTY, NOT A STYLE. The encrypted blob reaches the
- * disk BEFORE the row that names it is committed. The two failure windows are not symmetrical:
+ * `deposit` and `deployer` take their `orderId` from a row the caller creates once per address it
+ * intends to exist — wallet's deposit assignment id (`wallet/src/deposits.ts:196`) and mint's token
+ * id (`mint/src/deploy.ts:179`). A second key under one of those bindings is a duplicate mint by
+ * definition, and a rotation is safe because a rotation is a new assignment with a new id.
+ *
+ * `treasury` is excluded and its exclusion is the load-bearing half: `treasuryBinding` derives the
+ * binding from (chain, network) alone, so a rotation candidate is minted under the SAME binding on
+ * purpose. Deduplicating it would leave a pinned treasury with nowhere to rotate to.
+ */
+const BINDING_NAMES_ONE_ADDRESS: ReadonlySet<Purpose> = new Set<Purpose>(['deposit', 'deployer'])
+
+/**
+ * The two unique indexes migration 6 added. Named here so the race handler below can tell a
+ * duplicate provision apart from a duplicate ADDRESS, which is a derivation collision and must
+ * never be swallowed.
+ */
+const IDEMPOTENCY_CONSTRAINTS: ReadonlySet<string> = new Set([
+  'custody_keys_idempotency_uniq',
+  'custody_keys_binding_uniq',
+])
+
+const CONFLICT: ProvisionResult = {
+  ok: false,
+  status: 409,
+  code: 'idempotency_conflict',
+  // Says nothing about the request it collided with. Same caller or not, an error message is not a
+  // read surface, and the binding's entropy is the thing this service refuses to hand out.
+  error:
+    'this idempotency key has already been used for a different request — a different request ' +
+    'needs a different key',
+}
+
+/**
+ * Mint an address, or hand back the one an earlier identical request already got.
+ *
+ * ── THE ORDER OF THE WRITES IS A CORRECTNESS PROPERTY, NOT A STYLE ───────────────────────────
+ *
+ * The encrypted blob reaches the disk BEFORE the row that names it is committed. The two failure
+ * windows are not symmetrical:
  *
  *   crash after the blob, before the commit — an orphan blob at an address no row references.
  *     Costs one file. Nothing can ever be sent there, because the address was never published.
  *   crash after the commit, before the blob — a row naming an address whose key does not exist.
  *     The address IS published, a customer deposits to it, and the coins are unrecoverable.
  *
- * So the cheap failure is the one this ordering chooses, every time.
+ * So the cheap failure is the one this ordering chooses, every time. A provision that loses the
+ * race below takes exactly that cheap failure — it has already written a blob when the insert is
+ * refused — and that is the right trade for the same reason.
+ *
+ * ── AND THE LOOKUP IS NOT THE IDEMPOTENCY ────────────────────────────────────────────────────
+ *
+ * `findReplay` runs first because answering a retry without deriving a key is worth doing, but it
+ * cannot be what makes this safe: two concurrent provisions both read a table with nothing in it.
+ * Migration 6's unique indexes are the invariant; this function's job is to turn their 23505 into
+ * the address the winner got.
  */
 export async function provisionAddress(deps: KeyDeps, input: ProvisionRequest): Promise<ProvisionResult> {
   const family = familyForChain(input.chain)
-  if (!family) return { ok: false, code: 'unknown_chain', error: `'${input.chain}' is not a chain this service holds keys for` }
+  if (!family) {
+    return {
+      ok: false,
+      status: 400,
+      code: 'unknown_chain',
+      error: `'${input.chain}' is not a chain this service holds keys for`,
+    }
+  }
 
   const scheme: Scheme = input.scheme ?? 'hd_bip44'
+
+  const replay = await findReplay(deps, input)
+  if (replay) return replay
 
   if (scheme === 'flat_random' && family === 'xrp') {
     // THE XRP NETWORK-BINDING FIX, ENFORCED AT THE ONLY PLACE IT CAN BE. A flat random XRP family
@@ -112,6 +180,7 @@ export async function provisionAddress(deps: KeyDeps, input: ProvisionRequest): 
     // an XRP key without it. Adopted legacy rows keep the residual; nothing minted here adds one.
     return {
       ok: false,
+      status: 400,
       code: 'scheme_refused',
       error:
         'XRP addresses are HD-derived only — a flat-random family seed produces one address valid ' +
@@ -119,54 +188,67 @@ export async function provisionAddress(deps: KeyDeps, input: ProvisionRequest): 
     }
   }
 
-  const generated = await deps.sql
-    .begin(async (tx) => {
-      let seedId: string | null = null
-      let derivationPath: string | null = null
-      let address: string
-      let privateKey: string
+  let generated: CustodyKeyRow
+  try {
+    generated = await deps.sql
+      .begin(async (tx) => {
+        let seedId: string | null = null
+        let derivationPath: string | null = null
+        let address: string
+        let privateKey: string
 
-      if (scheme === 'hd_bip44') {
-        const seed = await ensureSeed(deps, tx, input.userId, family)
-        const index = await takeNextIndex(tx, seed.id)
-        const mnemonic = deps.keyring.decrypt(seedSlot(seed.id), await deps.vault.read(seedSlot(seed.id)))
-        const derived = deriveKey(seedFromMnemonic(mnemonic), family, input.network, index)
-        seedId = seed.id
-        derivationPath = derived.derivationPath
-        address = derived.address
-        privateKey = derived.privateKey
-      } else {
-        const flat = generateFlatRandom(family, input.network)
-        address = flat.address
-        privateKey = flat.privateKey
-      }
+        if (scheme === 'hd_bip44') {
+          const seed = await ensureSeed(deps, tx, input.userId, family)
+          const index = await takeNextIndex(tx, seed.id)
+          const mnemonic = deps.keyring.decrypt(seedSlot(seed.id), await deps.vault.read(seedSlot(seed.id)))
+          const derived = deriveKey(seedFromMnemonic(mnemonic), family, input.network, index)
+          seedId = seed.id
+          derivationPath = derived.derivationPath
+          address = derived.address
+          privateKey = derived.privateKey
+        } else {
+          const flat = generateFlatRandom(family, input.network)
+          address = flat.address
+          privateKey = flat.privateKey
+        }
 
-      // Encrypted immediately; the plaintext key only ever lived in this closure.
-      const blob = deps.keyring.encrypt(address, privateKey)
-      const storage = await deps.vault.write(address, blob)
+        // Encrypted immediately; the plaintext key only ever lived in this closure.
+        const blob = deps.keyring.encrypt(address, privateKey)
+        const storage = await deps.vault.write(address, blob)
 
-      const row = await insertKey(tx, {
-        address,
-        chain: input.chain,
-        family,
-        purpose: input.purpose,
-        network: input.network,
-        userId: input.userId,
-        orderId: input.orderId,
-        scheme,
-        derivationPath,
-        seedId,
-        keyVersion: deps.keyring.writeVersion,
-        storage,
-        createdBy: input.createdBy,
+        const row = await insertKey(tx, {
+          address,
+          chain: input.chain,
+          family,
+          purpose: input.purpose,
+          network: input.network,
+          userId: input.userId,
+          orderId: input.orderId,
+          scheme,
+          derivationPath,
+          seedId,
+          keyVersion: deps.keyring.writeVersion,
+          storage,
+          createdBy: input.createdBy,
+          idempotencyKey: input.idempotencyKey ?? null,
+        })
+        return { row: [row] }
       })
-      return { row: [row] }
-    })
-    .then((r) => r.row[0]!)
+      .then((r) => r.row[0]!)
+  } catch (err) {
+    const raced = await afterLosingTheRace(deps, input, err)
+    if (raced) return raced
+    throw err
+  }
 
   // The event is emitted in its own transaction rather than inside the one above, because the one
   // above holds a row lock on the seed for the whole of a scrypt derivation. Keeping the outbox
   // write out of it keeps the lock as short as the work that needs it.
+  //
+  // It is also the reason a replay returns BEFORE here rather than after: an event is a downstream
+  // effect — an indexer registration, a ledger entry, a notification — and emitting a second
+  // `custody.address.created` for an address that was not created is the duplicate mint arriving
+  // by another route.
   await withOutbox(deps.sql, deps.producer, async (_tx, emit) => {
     emit({
       topic: 'custody.address.created',
@@ -184,7 +266,104 @@ export async function provisionAddress(deps: KeyDeps, input: ProvisionRequest): 
     })
   })
 
-  return { ok: true, key: toKeyRecord(generated) }
+  return { ok: true, key: toKeyRecord(generated), reused: false }
+}
+
+/**
+ * The address an earlier request already got, if this request is that request again.
+ *
+ * TWO IDENTITIES, IN THIS ORDER.
+ *
+ * The caller's own key first, because it is the caller's statement about its own intent and it is
+ * the only one that can cover a request whose binding is deliberately fresh. Then the binding, for
+ * the purposes where a binding names one address by construction, because that catches the retry
+ * that carried no key at all.
+ *
+ * ── AND A KEY THAT MATCHES A DIFFERENT REQUEST IS A CONFLICT, NOT A REPLAY ───────────────────
+ *
+ * This is the case where being helpful would be dangerous. `orderId` is one of SD-09's five
+ * binding fields (`gates.ts:182`) and settlement must restate it character for character to sweep
+ * the address — "a guessed binding is a sweep refused every tick for ever"
+ * (`settlement/src/server.ts:739`). Handing back an address bound to a DIFFERENT order because the
+ * caller reused a key would file that address under a binding this service never stored, and every
+ * sweep of it would be refused for the life of the platform. The 409 costs a caller one retry.
+ */
+async function findReplay(deps: KeyDeps, input: ProvisionRequest): Promise<ProvisionResult | null> {
+  if (input.idempotencyKey !== undefined) {
+    const prior = await findKeyByIdempotencyKey(deps.sql, input.createdBy, input.idempotencyKey)
+    if (prior) {
+      return sameRequest(prior, input) ? { ok: true, key: toKeyRecord(prior), reused: true } : CONFLICT
+    }
+  }
+  if (BINDING_NAMES_ONE_ADDRESS.has(input.purpose)) {
+    const prior = await findKeyByBinding(deps.sql, {
+      chain: input.chain,
+      network: input.network,
+      purpose: input.purpose,
+      userId: input.userId,
+      orderId: input.orderId,
+    })
+    if (prior) return { ok: true, key: toKeyRecord(prior), reused: true }
+  }
+  return null
+}
+
+/**
+ * "The same request" — and `scheme` is deliberately not part of it.
+ *
+ * These five fields are what the row is derived from and what a signature is later bound to. A
+ * scheme is a preference about HOW to derive, and the reply states the one that was actually used,
+ * so a caller that asked for a different one is told the truth rather than given a second address
+ * for a binding that must only ever name one.
+ */
+function sameRequest(row: CustodyKeyRow, input: ProvisionRequest): boolean {
+  return (
+    row.chain === input.chain &&
+    row.network === input.network &&
+    row.purpose === input.purpose &&
+    row.user_id === input.userId &&
+    row.order_id === input.orderId
+  )
+}
+
+/**
+ * What to do when the database refused the insert because somebody else got there first.
+ *
+ * ONLY the two idempotency indexes are treated this way, by name. A 23505 on `custody_keys_pkey`
+ * is a second row for one ADDRESS — a derivation collision or a repeated index — and swallowing it
+ * would return a key belonging to somebody else; it is re-thrown so the caller gets a 500 and an
+ * operator gets a page.
+ *
+ * The loser has already written an encrypted blob for an address no row will ever name. That is the
+ * orphan-blob failure this file chooses on purpose everywhere else: one unreferenced file, at an
+ * address that was never published and that nothing can be sent to. It is NOT deleted — this
+ * service does not remove key material on an error path, because "the address was never published"
+ * is an inference and an unrecoverable deletion is not the place to be inferring.
+ */
+async function afterLosingTheRace(
+  deps: KeyDeps,
+  input: ProvisionRequest,
+  err: unknown,
+): Promise<ProvisionResult | null> {
+  const violation = err as { code?: unknown; constraint_name?: unknown }
+  if (violation.code !== '23505') return null
+  const constraint = violation.constraint_name
+  if (typeof constraint !== 'string' || !IDEMPOTENCY_CONSTRAINTS.has(constraint)) return null
+
+  const winner = await findReplay(deps, input)
+  if (!winner) {
+    // Unreachable unless the winner was rolled back between the violation and this read, which
+    // cannot happen: the violation proves it committed. Loud rather than silent, because the
+    // alternative to knowing is minting a second address.
+    throw new Error(`provisioning lost a race to ${constraint} but the winning row could not be read back`)
+  }
+  deps.logger.info('provisioning replayed a request that raced itself', {
+    audit: 'provision_raced',
+    constraint,
+    actor: input.createdBy,
+    purpose: input.purpose,
+  })
+  return winner
 }
 
 /**

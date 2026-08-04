@@ -83,6 +83,32 @@ export const BOB = '22222222-2222-4222-8222-222222222222'
 
 export const silentLogger = new Logger({ service: 'custody-test', level: 'error', version: 'test', env: 'test' })
 
+/**
+ * A logger that keeps the `audit` tag of everything written through it, and prints nothing.
+ *
+ * It exists for one assertion and it is worth the plumbing: the concurrency cases need to prove
+ * that the UNIQUE INDEX refused the second insert, not that the lookup happened to run first. Those
+ * two are indistinguishable from the outside — both end with one address — and a test that cannot
+ * tell them apart would pass just as happily against a service with no constraint at all.
+ *
+ * Subclassed rather than faked because `Logger` carries a private field, so a structural stand-in
+ * is not assignable to it — which is the type system doing its job.
+ */
+export class CapturingLogger extends Logger {
+  readonly audits: string[] = []
+  override info(message: string, fields?: Record<string, unknown>): void {
+    const audit = fields?.['audit']
+    if (typeof audit === 'string') this.audits.push(audit)
+  }
+  count(audit: string): number {
+    return this.audits.filter((a) => a === audit).length
+  }
+}
+
+export function capturingLogger(): CapturingLogger {
+  return new CapturingLogger({ service: 'custody-test', level: 'error', version: 'test', env: 'test' })
+}
+
 /** A policy that always answers the same thing. The real one is the only outbound call custody has. */
 export function fixedPolicy(decision: PolicyDecision): PolicyClient {
   return { decide: async () => decision }
@@ -113,12 +139,14 @@ export async function harness(options: {
   tokenTtlMs?: number
   requestTtlMs?: number
   vault?: Vault
+  logger?: Logger
 }): Promise<Harness> {
   const keyring = options.keyring ?? keyringFor({ 1: SECRET_V1, 2: SECRET_V2 }, 2)
   const vault = options.vault ?? new MemoryVault()
+  const logger = options.logger ?? silentLogger
   let clock = Date.UTC(2026, 0, 1, 12, 0, 0)
 
-  const keys: KeyDeps = { sql: options.sql, vault, keyring, logger: silentLogger, producer: 'custody' }
+  const keys: KeyDeps = { sql: options.sql, vault, keyring, logger, producer: 'custody' }
   const exportDeps: ExportDeps = {
     sql: options.sql,
     vault,
@@ -197,7 +225,10 @@ export function userToken(userId: string, options: { roles?: Role[]; amr?: strin
 
 export interface RunningServer {
   readonly url: string
-  request(path: string, options?: { method?: string; token?: string; body?: unknown }): Promise<{
+  request(
+    path: string,
+    options?: { method?: string; token?: string; body?: unknown; headers?: Record<string, string> },
+  ): Promise<{
     status: number
     headers: Headers
     body: Record<string, unknown>
@@ -221,6 +252,11 @@ export async function startServer(deps: ServerDeps): Promise<RunningServer> {
         headers: {
           'content-type': 'application/json',
           ...(options.token ? { authorization: `Bearer ${options.token}` } : {}),
+          // Last, so a case can drive a header the helper also sets — `idempotency-key` is not one
+          // the helper sets at all, and it is the reason this parameter exists: the key travels as
+          // a HEADER (`@cloudsforge/http` sets it from `request.idempotencyKey`), so a suite that
+          // could only send a body could not exercise the route the callers actually reach.
+          ...(options.headers ?? {}),
         },
         ...(options.body === undefined ? {} : { body: JSON.stringify(options.body) }),
       })

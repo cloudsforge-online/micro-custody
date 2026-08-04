@@ -284,6 +284,69 @@ export const MIGRATIONS: readonly Migration[] = [
           references custody_keys (address, chain, network, purpose);
     `,
   },
+  {
+    version: 6,
+    name: 'provisioning_idempotency',
+    /*
+     * A RETRY MUST NOT MINT A SECOND ADDRESS, AND THE DATABASE IS WHAT SAYS SO.
+     *
+     * Until this migration custody had no idempotency of any kind: `provisionAddress` minted
+     * unconditionally and the `idempotency-key` header both callers send was discarded at the
+     * boundary. That is not a duplicate row. An address is where a user is told to send money, so a
+     * second one is a second place their funds can arrive — a place nothing is watching, nothing
+     * sweeps, and the ledger has no entry for. Retries are the ordinary case here: both callers
+     * reach this service over HTTP, and `@cloudsforge/http` RETRIES a POST by itself precisely when
+     * an idempotency key is present, so the client believed to be making the call safe was the
+     * thing making the duplicate.
+     *
+     * TWO IDENTITIES, BECAUSE THE TWO CALLERS OFFER TWO DIFFERENT THINGS.
+     *
+     * 1. `(created_by, idempotency_key)` — what the CALLER says is the same request. Scoped by
+     *    actor: the string is the caller's own to choose, and two services picking 'deposit-1' must
+     *    not become one address. NULL is not equal to NULL in a unique index, so a caller that
+     *    sends no key is simply not covered by this one.
+     *
+     * 2. `(chain, network, purpose, user_id, order_id)` for 'deposit' and 'deployer' — the SD-09
+     *    binding, which for those two purposes is one-per-address by construction: wallet's
+     *    `orderId` is its deposit assignment's primary key and mint's is the token's id, both
+     *    created once per address they intend to exist. A second row under one binding therefore
+     *    cannot be anything but a duplicate mint, whatever the caller meant.
+     *
+     * AND WHY 'treasury' IS ABSENT FROM THE SECOND, which is the constraint's most important line.
+     * A treasury's binding is DERIVED from (chain, network) alone — `keys.treasuryBinding` — so
+     * every rotation candidate a chain will ever have carries the same one on purpose. Rotation is
+     * three deliberate steps (mint, move the balance, pin) and this index would delete the first of
+     * them for ever after the first pin. That route has its own reuse rule, `pickOutstandingCandidate`,
+     * which is deliberately time-and-pin-aware in a way a unique index cannot be. 'user' is absent
+     * for a weaker reason and it is worth being honest about it: no caller in the estate mints one,
+     * so nothing establishes that its `orderId` is per-address, and a constraint whose justification
+     * is "nobody does this" is a constraint that will be wrong the day somebody does.
+     *
+     * ORDINARY INDEXES, NOT `CONCURRENTLY`: the migrator is a one-shot job holding an advisory lock
+     * and `@cloudsforge/db` runs each migration in a transaction, which `CONCURRENTLY` cannot join.
+     * custody_keys is small — it holds one row per address the platform has ever minted — and the
+     * lock is measured in milliseconds.
+     */
+    up: `
+      alter table custody_keys add column if not exists idempotency_key text;
+
+      -- Bounded here as well as at the route, because the route is the thing that is one deploy
+      -- away from forgetting. An empty string is not a key: it is a caller that sent the header and
+      -- put nothing in it, and treating it as an identity would make every such request "the same".
+      alter table custody_keys drop constraint if exists custody_keys_idempotency_ck;
+      alter table custody_keys
+        add constraint custody_keys_idempotency_ck
+          check (idempotency_key is null or (length(idempotency_key) between 1 and 255));
+
+      create unique index if not exists custody_keys_idempotency_uniq
+        on custody_keys (created_by, idempotency_key)
+        where idempotency_key is not null;
+
+      create unique index if not exists custody_keys_binding_uniq
+        on custody_keys (chain, network, purpose, user_id, order_id)
+        where purpose in ('deposit', 'deployer');
+    `,
+  },
 ]
 
 /**
