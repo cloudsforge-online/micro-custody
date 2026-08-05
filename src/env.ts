@@ -18,9 +18,23 @@
  * WHAT IS DELIBERATELY ABSENT: any RPC endpoint, any price feed, any product service URL. Custody
  * makes no outbound call except to `policy` (03 §3, SD-13). Its network reachability is the whole
  * security model, so a variable naming a third destination would be the defect, not the feature.
+ *
+ * `CUSTODY_TOKEN` IS ALSO DELIBERATELY ABSENT, and it is worth saying so rather than leaving the
+ * next reader to rediscover it. That variable exists — `deploy/compose/docker-compose.estate.yml`
+ * sets it on `faucet` and `faucet-migrate`, fed from `FAUCET_CUSTODY_TOKEN` — but it belongs to
+ * micro-faucet, which READS it (`faucet/src/env.ts:400`) and PRESENTS it to this service as a
+ * bearer. Custody is the audience, not the holder: it verifies whatever arrives against the JWKS at
+ * `IDENTITY_JWKS_URL`, so it needs no copy of the token and must never be given one. Declaring it
+ * here would put it in the manifest rule 9 derives from this file, and a service that is handed a
+ * credential it does not use is exactly the `env_file:` fan-out that rule exists to end.
+ *
+ * (The live value is an EXPIRED JWT — micro-org #222 — which is a real defect and is micro-faucet's
+ * to fix, by adopting `ServiceTokenProvider` against `FAUCET_IDENTITY_CREDENTIAL`. Nothing in this
+ * file can fix it, and nothing in this file should pretend to.)
  */
 
 import { hostname } from 'node:os'
+import { SecretError, assertGeneratedSecret } from '@cloudsforge/secrets'
 
 /**
  * The service's own name. A constant, not a variable: it seeds the migration advisory lock, and
@@ -37,22 +51,25 @@ export class EnvError extends Error {
 }
 
 /**
- * Values that must never be accepted. Short on purpose: these are the strings that actually appear
- * in this repository's own `.env.example` and in the estate's compose files, because those are the
- * ones somebody in a hurry copies into a deployment.
+ * THE `PLACEHOLDERS` SET THAT USED TO BE HERE IS GONE, AND ITS ABSENCE IS THE FIX.
+ *
+ * It held ten exact strings and was paired with a 32-character floor. Neither could fail for the
+ * value that actually reached 44 containers on both networks: micro-org #142's
+ * `estate-only-outbox-secret-00000000000000` is 40 characters and was on nobody's list. A check
+ * that cannot fail is worse than no check, because the absence of an alarm gets read as the absence
+ * of a problem — and this service holds every private key the platform custodies.
+ *
+ * A deny-list of exact strings is structurally unable to work: the next placeholder somebody writes
+ * is, by definition, not on it. `@cloudsforge/secrets` asserts the SHAPE of a generated value
+ * instead, which is the property a placeholder cannot have. It is imported rather than copied so
+ * that this service cannot drift from the other sixteen.
+ *
+ * The floors, the marker list and the ordering in that package were PORTED FROM THIS FILE — the
+ * `assertMasterSecret` that used to live below was the only guard in the estate that got this
+ * right, and micro-org #143 was the job of folding it in. What is deleted here is therefore the
+ * original, not a copy of it, and keeping a second copy behind would be the drift the package
+ * exists to prevent.
  */
-const PLACEHOLDERS = new Set([
-  'changeme',
-  'change-me',
-  'placeholder',
-  'secret',
-  'dev-secret',
-  'dev-master-secret',
-  'dev-outbox-signing-secret',
-  'replace-with-a-real-secret',
-  'test-master-secret',
-  'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
-])
 
 type Source = Readonly<Record<string, string | undefined>>
 
@@ -63,55 +80,71 @@ function required(source: Source, name: string): string {
 }
 
 /**
- * A secret, with the two checks that matter. Length is a proxy for entropy and the only one
- * available here; it is set above the point at which a human-chosen string is plausible, so a
- * memorable password fails too.
+ * Re-wrap the shared guard's `SecretError` as this service's `EnvError`.
+ *
+ * `loadEnv` documents a single error class for every configuration failure, and the boot path
+ * catches that one class. The message is preserved verbatim — it already names the variable and the
+ * command that fixes it, and it never contains the value.
  */
-function requiredSecret(source: Source, name: string, minLength = 32): string {
+function asEnvError<T>(run: () => T): T {
+  try {
+    return run()
+  } catch (err) {
+    if (err instanceof SecretError) throw new EnvError(err.message)
+    throw err
+  }
+}
+
+/**
+ * A secret THIS ESTATE GENERATES, held to the shape a generator produces and a keyboard does not.
+ *
+ * `assertGeneratedSecret` is the right class for both of custody's secret variables, and that was
+ * checked against the running containers rather than inferred from the names — the estate has
+ * `*_TOKEN` variables holding `cfsc_` credentials and `*_TOKEN` variables holding JWTs under the
+ * same suffix, so a name classifies nothing. Measured on 2026-08-05:
+ *
+ *     CUSTODY_MASTER_SECRET_V2   base64, 64 characters, 48 bytes
+ *     CUSTODY_MASTER_SECRET_V3   base64, 64 characters, 48 bytes
+ *     OUTBOX_SIGNING_SECRET      base64, 64 characters, 48 bytes
+ *
+ * All three are `openssl rand` output written into a gitignored file by an operator following a
+ * runbook, so the estate controls the alphabet and the strict rule is the correct one. Neither of
+ * the other two classes applies: nothing here is minted by identity, and nothing here arrives from
+ * a vendor whose alphabet somebody else chose.
+ *
+ * The old `minLength` parameter is gone rather than kept in front: it is a strict subset of the
+ * shape check, and running it first answers a 40-character placeholder with "must be at least 32
+ * characters" — true, useless, and about the wrong property.
+ */
+function requiredGeneratedSecret(source: Source, name: string): string {
   const value = required(source, name)
-  assertSecret(name, value, minLength)
+  asEnvError(() => assertGeneratedSecret(name, value))
   return value
 }
 
-function assertSecret(name: string, value: string, minLength: number): void {
-  if (PLACEHOLDERS.has(value.toLowerCase())) {
-    throw new EnvError(`${name} is set to a known placeholder — generate a real secret`)
-  }
-  if (value.length < minLength) {
-    throw new EnvError(`${name} must be at least ${minLength} characters (got ${value.length})`)
-  }
-}
-
-/* ------------------------------------------------------- the master-secret guard, and its argument
+/* -------------------------------------------- the master-secret guard, and where it lives now
  *
  * WHAT FAILED. `deploy/compose/docker-compose.estate.yml` carried a hardcoded 40-character master
  * secret in a PUBLIC repository, under a comment reading "Minimum 32 characters" — and it was. It
- * passed `requiredSecret` above: not one of the eight strings in `PLACEHOLDERS`, and longer than the
- * floor. Everything the estate had encrypted at rest was therefore encrypted under a value anybody
- * could read. The control that was supposed to stop this was a comment, and a comment is not a
- * control; a deny-list of exact strings is barely one, because the next placeholder somebody writes
- * is by definition not on it.
+ * passed the `requiredSecret` this file used to carry: not one of the ten strings in `PLACEHOLDERS`,
+ * and longer than the floor. Everything the estate had encrypted at rest was therefore encrypted
+ * under a value anybody could read. The control that was supposed to stop this was a comment, and a
+ * comment is not a control; a deny-list of exact strings is barely one, because the next placeholder
+ * somebody writes is by definition not on it.
  *
- * THE RULE, AND WHY IT IS THIS ONE. A guard cannot test secrecy — it holds a string, not the
- * internet. What it CAN test is whether the string has the shape of a generator's output rather than
- * a keyboard's, and every placeholder that has ever reached this estate came from a keyboard. So:
+ * THE RULE HAS NOT CHANGED — IT HAS MOVED. `@cloudsforge/secrets` asserts the shape of a generator's
+ * output rather than a keyboard's: base64 or hex and nothing else, at least 32 decoded BYTES, a
+ * MEASURED Shannon entropy floor per alphabet, and a normalised placeholder marker anywhere in the
+ * value. Those four checks, those floors and that ordering were lifted from the function that stood
+ * here — this file was the only place in the estate that got it right, and micro-org #143 was the
+ * job of promoting it so the other sixteen services stop each writing their own slightly different
+ * version. Read that package's header for the argument; it is not repeated here, because two copies
+ * of an argument drift exactly as fast as two copies of a check.
  *
- *   1. The value must be BASE64 or HEX and nothing else. This alone rejects every placeholder in the
- *      estate's compose files, because a human writing a memorable value reaches for a hyphen and
- *      neither alphabet contains one. It costs an operator nothing: `openssl rand -base64 48` is
- *      what the README already tells them to run.
- *   2. It must decode to at least 32 BYTES. The old floor counted keystrokes; the unit that matters
- *      is entropy, and 32 characters of prose is not 32 bytes of key.
- *   3. Its Shannon entropy per character must clear a floor, which is what rejects a value that is
- *      long, well-formed and degenerate — 64 zeros, `deadbeef` eight times. The floors are MEASURED,
- *      not guessed: over 200,000 samples the minimum was 4.292 for `rand -base64 32`, 4.605 for
- *      `rand -base64 48`, and 3.375 for `rand -hex 32`. The floors sit below those with margin, so
- *      the chance of refusing a genuinely generated secret is negligible — which matters, because a
- *      guard that occasionally rejects correct input is a guard somebody removes.
- *   4. A normalised placeholder MARKER anywhere in the value is refused. Punctuation and case are
- *      stripped first, so `estate-only`, `ESTATE_ONLY` and `estateonly` are one rule. This is
- *      redundant with (1) for every value seen so far, and it is kept because it is the check that
- *      still fires the day somebody base64s a placeholder.
+ * ONE CLAIM THAT USED TO BE HERE WAS WRONG AND IS NOT CARRIED FORWARD. This file said the marker
+ * check "still fires the day somebody base64s a placeholder". It does not: base64 destroys the
+ * substring the marker matches on, measured in that package's own test. The check is still worth
+ * having for a placeholder WRITTEN in the base64 alphabet, which is a different thing.
  *
  * THERE IS NO OFF SWITCH, AND THAT IS THE POINT. No `NODE_ENV` exemption, no `CUSTODY_ALLOW_*`
  * variable, no CI branch. An escape hatch is a comment with a longer name — it would be reached for
@@ -122,120 +155,13 @@ function assertSecret(name: string, value: string, minLength: number): void {
  * passes, and nothing here can know that. Secrecy is the deploy's job and is bought by the value
  * living only in a gitignored file — see `deploy/compose/docker-compose.estate.yml`'s custody block.
  *
- * SCOPE: MASTER SECRETS ONLY, on purpose. `OUTBOX_SIGNING_SECRET` is one shared HMAC key across
- * fifteen services, and holding custody alone to this rule would stop custody booting on a value
- * every peer still accepts — an outage, not a fix. The estate's outbox secret is a placeholder in
- * the same public file and is a LIVE DEFECT; it needs one coordinated rotation across every service
- * that verifies with it, which is a different change from this one.
+ * SCOPE IS NO LONGER "MASTER SECRETS ONLY". This file used to argue that `OUTBOX_SIGNING_SECRET`
+ * had to be exempt, because holding custody alone to the strict rule would stop custody booting on a
+ * value every peer still accepts. That was true when it was written and is not true now: the estate
+ * rotated the outbox key onto generated material (measured on both networks: 64 characters, 32
+ * bytes, in one alphabet), and the guard is landing in every service at once rather than in this one.
+ * The exemption was the last thing keeping the #142 placeholder bootable here, so it is gone.
  */
-
-/** Standard base64, padding optional. `-` and `_` are absent on purpose: see marker note below. */
-const BASE64_ONLY = /^[A-Za-z0-9+/]+={0,2}$/
-const HEX_ONLY = /^[0-9a-fA-F]+$/
-
-/** Bytes, not characters. `openssl rand -base64 32` and `openssl rand -hex 32` both clear it. */
-const MIN_SECRET_BYTES = 32
-
-/**
- * Shannon entropy floors, per character, per alphabet — because the ceilings differ: 6 bits for
- * base64 and 4 for hex, so one number cannot serve both. See the measured minima in the header.
- */
-const MIN_ENTROPY_BASE64 = 4.0
-const MIN_ENTROPY_HEX = 2.8
-
-/**
- * Placeholder markers, PUNCTUATION AND CASE STRIPPED before matching.
- *
- * Every entry is six characters or more. That is not stylistic: the test is a substring test over a
- * value that may legitimately be random, and a four-letter marker would match a genuine secret about
- * once in seventeen thousand — a boot failure nobody could explain. At six the odds are below one in
- * ten million per marker, and a spurious refusal is one regeneration away in any case.
- */
-const SECRET_MARKERS = [
-  'estateonly',
-  'testonly',
-  'localonly',
-  'changeme',
-  'placeholder',
-  'notareal',
-  'notarealsecret',
-  'donotuse',
-  'insecure',
-  'example',
-  'replaceme',
-  'temporary',
-  'password',
-  'mastersecret',
-  'sufficientlength',
-]
-
-function normalise(value: string): string {
-  return value.toLowerCase().replace(/[^a-z0-9]/g, '')
-}
-
-/** Shannon entropy of the value's own character distribution, in bits per character. */
-export function entropyPerChar(value: string): number {
-  const counts = new Map<string, number>()
-  for (const char of value) counts.set(char, (counts.get(char) ?? 0) + 1)
-  let bits = 0
-  for (const n of counts.values()) {
-    const p = n / value.length
-    bits -= p * Math.log2(p)
-  }
-  return bits
-}
-
-/**
- * The one gate every `CUSTODY_MASTER_SECRET_V<n>` passes through.
- *
- * NO MESSAGE BELOW CONTAINS THE VALUE. `fatalConfig` writes `err.message` verbatim to stderr and the
- * collector ships it, so an echoed secret would move from one public place to another. Lengths and
- * measurements only — and every message names the variable and the command that fixes it, because a
- * refusal an operator cannot act on is an outage rather than a control.
- */
-export function assertMasterSecret(name: string, value: string): void {
-  const fix = `generate one with: openssl rand -base64 48`
-
-  if (PLACEHOLDERS.has(value.toLowerCase())) {
-    throw new EnvError(`${name} is set to a known placeholder — ${fix}`)
-  }
-
-  const flat = normalise(value)
-  for (const marker of SECRET_MARKERS) {
-    if (flat.includes(marker)) {
-      throw new EnvError(`${name} reads as a placeholder (it contains '${marker}') — ${fix}`)
-    }
-  }
-
-  const hex = HEX_ONLY.test(value)
-  const base64 = !hex && BASE64_ONLY.test(value)
-  if (!hex && !base64) {
-    // The check that catches every placeholder this estate has actually written, all of which
-    // contain a hyphen. Naming the alphabets rather than the offending character keeps the value out
-    // of the message.
-    throw new EnvError(
-      `${name} is not base64 or hex — a master secret is generated, not typed, and a typed one is ` +
-        `readable by whoever reads the file it was typed into. ${fix}`,
-    )
-  }
-
-  const bytes = hex ? Math.floor(value.length / 2) : Buffer.from(value, 'base64').length
-  if (bytes < MIN_SECRET_BYTES) {
-    throw new EnvError(
-      `${name} carries ${bytes} bytes of key material and at least ${MIN_SECRET_BYTES} are required ` +
-        `— length in CHARACTERS is not the unit that matters. ${fix}`,
-    )
-  }
-
-  const floor = hex ? MIN_ENTROPY_HEX : MIN_ENTROPY_BASE64
-  const measured = entropyPerChar(value)
-  if (measured < floor) {
-    throw new EnvError(
-      `${name} is long enough but its entropy is ${measured.toFixed(2)} bits per character, below ` +
-        `the ${floor} floor for ${hex ? 'hex' : 'base64'} — a repeated pattern is not a key. ${fix}`,
-    )
-  }
-}
 
 function optional(source: Source, name: string, fallback: string): string {
   const value = source[name]?.trim()
@@ -300,6 +226,14 @@ export function collectMasterSecrets(source: Source): Map<number, string> {
   for (const [name, raw] of Object.entries(source)) {
     const match = MASTER_SECRET_VAR.exec(name)
     if (!match) continue
+    // EMPTY IS UNSET, AND THAT IS A SUPPORTED MODE RATHER THAN AN OVERSIGHT. Compose interpolates
+    // `${CUSTODY_MASTER_SECRET_V3:-}` and an unset variable arrives as the empty string, not as an
+    // absent key — so a deployment that has only reached step 1 of a rotation for ONE of its two
+    // networks renders an empty `_V3` on the other. Skipping it is safe only because the WRITE
+    // version must be present in the map: an empty `_V3` cannot silently downgrade new blobs back
+    // to v2, it fails to boot with `CUSTODY_KEY_VERSION` named. The check therefore stays AHEAD of
+    // the assertion; putting the assertion first would turn every such render into `exit(1)` on the
+    // service that holds every custodied key.
     const value = raw?.trim()
     if (!value) continue
     const version = Number(match[1])
@@ -311,7 +245,7 @@ export function collectMasterSecrets(source: Source): Map<number, string> {
     // the drain" is the whole compromise for as long as the drain takes. Draining off a placeholder
     // is therefore work for the image that predates this guard, which is friction in exactly the
     // right direction.
-    assertMasterSecret(name, value)
+    asEnvError(() => assertGeneratedSecret(name, value))
     secrets.set(version, value)
   }
   return secrets
@@ -358,7 +292,8 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
     databasePoolMax: integer(source, 'CUSTODY_DATABASE_POOL_MAX', 10, 1, 100),
     identityJwksUrl: required(source, 'IDENTITY_JWKS_URL'),
     identityIssuer: required(source, 'IDENTITY_ISSUER'),
-    outboxSigningSecret: requiredSecret(source, 'OUTBOX_SIGNING_SECRET'),
+    // No longer exempt from the shape rule — see "SCOPE IS NO LONGER MASTER SECRETS ONLY" above.
+    outboxSigningSecret: requiredGeneratedSecret(source, 'OUTBOX_SIGNING_SECRET'),
     instanceId: optional(source, 'INSTANCE_ID', host || 'unknown'),
     dataDir: optional(source, 'CUSTODY_DATA_DIR', '/var/lib/custody/keys'),
     keyVersion,

@@ -26,28 +26,30 @@ jobs:
       port: 4008
       # The image startup smoke test boots the real service, and `env.ts` validates its
       # configuration at import — so the container needs the variables it declares, not just a
-      # database, or it exits before it serves /livez. These are CI-only NON-secrets: throwaway
-      # values that only have to clear a length check, and URLs that are never dialled because
-      # /livez needs no upstream. Never a real credential.
+      # database, or it exits before it serves /livez. The URLs are never dialled, because /livez
+      # needs no upstream.
       #
-      # THE MASTER SECRET IS THE COMMIT SHA, TWICE, AND NOT A WRITTEN-DOWN STRING.
-      # `env.ts:assertMasterSecret` now refuses anything that reads as a placeholder, and the value
-      # that used to sit here — `ci-only-not-a-real-secret-at-least-32-chars-0000` — was one: it is
-      # exactly the shape that shipped a 40-character master secret in the estate's PUBLIC compose
-      # file and booted, because it cleared a length check and a comment said it was fine.
+      # NEITHER SECRET IS A LITERAL, AND THE COMMENT THAT USED TO SIT HERE WAS THE DEFECT WRITTEN
+      # DOWN. It described these as "throwaway values that only have to clear a length check" —
+      # which is exactly the reasoning that shipped a 40-character master secret in the estate's
+      # PUBLIC compose file and booted it, because it cleared a length check and a comment said it
+      # was fine (micro-org #142). The value that stood on the OUTBOX line,
+      # `ci-only-not-a-real-secret-000000000000`, is refused outright by the guard now — it
+      # normalises to a string containing the marker `cionly`.
       #
-      # Two SHAs are 80 hex characters, which clears the 32-byte floor, and a hash clears the
-      # entropy floor with margin (measured: minimum 3.04 bits per character over 200,000 doubled
-      # SHA-1s, against a floor of 2.8). It changes every run, it is a PUBLIC value that could never
-      # be mistaken for a credential, and no literal is left here for somebody to copy into a
-      # deployment — which is the failure mode the whole change is about. The smoke container
-      # encrypts nothing that outlives it.
+      # `KEY=@generate` is expanded by `service-ci.yml` into a fresh `openssl rand -base64 48` per
+      # run and thrown away afterwards. CI never needed a WEAK secret; it needed A secret, and the
+      # difference is that no literal is left here for anyone to copy into a deployment. It also
+      # replaces the doubled-`github.sha` trick this file used for the master secret: that value was
+      # correct (80 hex characters, 40 bytes, measured entropy clear of the floor) but it was a
+      # bespoke answer to a question the shared workflow now answers for all seventeen services.
+      # The smoke container encrypts nothing that outlives it.
       smoke-env: |
         IDENTITY_JWKS_URL=http://127.0.0.1:4001/.well-known/jwks.json
         IDENTITY_ISSUER=http://127.0.0.1:4001
-        OUTBOX_SIGNING_SECRET=ci-only-not-a-real-secret-000000000000
+        OUTBOX_SIGNING_SECRET=@generate
         POLICY_BASE_URL=http://127.0.0.1:4011
-        CUSTODY_MASTER_SECRET_V1=${{ github.sha }}${{ github.sha }}
+        CUSTODY_MASTER_SECRET_V1=@generate
     secrets:
       # @cloudsforge/* is resolved by link:../runtime and link:../contracts, so CI checks out
       # micro-runtime and micro-contracts as siblings — both private, so the workflow needs a

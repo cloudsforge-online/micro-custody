@@ -11,10 +11,21 @@ import assert from 'node:assert/strict'
 import { randomBytes } from 'node:crypto'
 import test from 'node:test'
 
-const SECRET = 'a-real-looking-secret-of-sufficient-length-0123'
+/**
+ * A hand-written string that USED TO BE THIS SUITE'S IDEA OF A VALID SECRET.
+ *
+ * It was named `SECRET` and it was `OUTBOX_SIGNING_SECRET` in `BASE`, so every test in this file
+ * ran against it and the suite as a whole asserted that it was acceptable. It is not, and it never
+ * was: it is hyphenated (so it is in neither the base64 nor the hex alphabet, which is the check
+ * that catches every placeholder this estate has actually written), and once punctuation and case
+ * are stripped it literally contains the marker `sufficientlength`.
+ *
+ * It is kept, renamed, for the one job it can honestly do — being a value the guard must REFUSE.
+ */
+const REFUSED_SHAPE = 'a-real-looking-secret-of-sufficient-length-0123'
 
 /**
- * A master secret fixture, GENERATED rather than written down.
+ * A secret fixture, GENERATED rather than written down.
  *
  * A literal here would be a string somebody could copy into a deployment, and the whole subject of
  * this file is what happens when they do. `openssl rand -base64 48` is what the README tells an
@@ -36,7 +47,9 @@ const BASE: Record<string, string> = {
   CUSTODY_DATABASE_URL: 'postgres://localhost/custody_test',
   IDENTITY_JWKS_URL: 'http://identity:4000/.well-known/jwks.json',
   IDENTITY_ISSUER: 'https://id.cloudsforge.test',
-  OUTBOX_SIGNING_SECRET: SECRET,
+  // GENERATED, not written. This was `REFUSED_SHAPE` above, which means every case in this file
+  // was running against an outbox secret the estate's own guard now refuses.
+  OUTBOX_SIGNING_SECRET: master(),
   POLICY_BASE_URL: 'http://policy:4009',
   CUSTODY_MASTER_SECRET_V2: master(),
 }
@@ -173,17 +186,59 @@ test('the refusal names the variable and never echoes the value', () => {
   )
 })
 
-test('OUTBOX_SIGNING_SECRET is DELIBERATELY not held to the master-secret rule', () => {
-  // Scope, asserted so that widening it is a decision somebody makes on purpose. The outbox secret
-  // is one shared HMAC key across fifteen services; holding custody alone to a stricter rule would
-  // stop custody booting on a value every one of its peers still accepts. It is a live gap and it
-  // is recorded as one — see the file header of env.ts.
-  assert.doesNotThrow(() => loadEnv({ ...BASE, OUTBOX_SIGNING_SECRET: SECRET }))
+test('OUTBOX_SIGNING_SECRET is held to EXACTLY the rule the master secrets are — the exemption is gone', () => {
+  // ══════════════════════════════════════════════════════════════════════════════════════════════
+  // THIS TEST IS THE INVERSE OF THE ONE IT REPLACES, AND THE OLD ONE WAS DEFENDING THE DEFECT.
+  //
+  // It read `OUTBOX_SIGNING_SECRET is DELIBERATELY not held to the master-secret rule` and it
+  // asserted `doesNotThrow` on `REFUSED_SHAPE` — a hyphenated, hand-written string containing the
+  // marker `sufficientlength`. The argument for the exemption was real at the time: one shared HMAC
+  // key across fifteen services, and holding custody alone to the strict rule would have stopped
+  // custody booting on a value every peer still accepted. But an assertion that a bad value LOADS
+  // is a test that goes red the moment the value stops being bad, so the fix could not land without
+  // this file objecting to it.
+  //
+  // Both halves of the argument have expired: the estate rotated the outbox key onto generated
+  // material (measured on both networks — 64 characters, 32 bytes, one alphabet), and the guard is
+  // landing across every service at once rather than in custody alone.
+  // ══════════════════════════════════════════════════════════════════════════════════════════════
+  assert.throws(
+    () => loadEnv({ ...BASE, OUTBOX_SIGNING_SECRET: REFUSED_SHAPE }),
+    (err: unknown) =>
+      err instanceof EnvError &&
+      err.message.includes('OUTBOX_SIGNING_SECRET') &&
+      !err.message.includes(REFUSED_SHAPE),
+  )
+  // And the estate placeholder itself — 40 characters, which cleared the old 32-character floor and
+  // was on nobody's deny-list, which is the whole of micro-org #142.
+  assert.throws(
+    () => loadEnv({ ...BASE, OUTBOX_SIGNING_SECRET: 'estate-only-outbox-secret-00000000000000' }),
+    EnvError,
+  )
+  assert.doesNotThrow(() => loadEnv({ ...BASE, OUTBOX_SIGNING_SECRET: master() }))
 })
 
-test('a short secret is refused — length is the only entropy proxy available here', () => {
-  assert.throws(() => loadEnv({ ...BASE, CUSTODY_MASTER_SECRET_V2: 'short' }), EnvError)
-  assert.throws(() => loadEnv({ ...BASE, OUTBOX_SIGNING_SECRET: 'still-too-short' }), EnvError)
+test('a short secret is refused, and the unit is BYTES rather than keystrokes', () => {
+  // This used to be titled `length is the only entropy proxy available here`, which stated the old
+  // rule as a fact. Length was never the only proxy — it was the only one this file implemented,
+  // and counting keystrokes is precisely what let a 40-character placeholder through.
+  //
+  // `hunter2` is spelled entirely in the base64 alphabet, so it is not the alphabet that catches
+  // it: it decodes to five bytes. The assertion is on the PROPERTY (bytes, the floor, the variable
+  // named, the value absent) rather than on any particular wording, so a future improvement to the
+  // message cannot fail CI for being an improvement.
+  for (const name of ['CUSTODY_MASTER_SECRET_V2', 'OUTBOX_SIGNING_SECRET']) {
+    assert.throws(
+      () => loadEnv({ ...BASE, [name]: 'hunter2' }),
+      (err: unknown) =>
+        err instanceof EnvError &&
+        /5 bytes of key material/.test(err.message) &&
+        /at least 32/.test(err.message) &&
+        err.message.includes(name) &&
+        !err.message.includes('hunter2'),
+      name,
+    )
+  }
 })
 
 test('with NO master secret at all, custody refuses to boot', () => {
@@ -212,8 +267,8 @@ test('the master secrets are collected BY PATTERN, so a rotation is a deploy and
     // Not a master secret. The pattern is anchored, so a near-miss is ignored rather than
     // silently becoming version NaN — and note that these two values would FAIL the master-secret
     // guard, so if the pattern ever loosened this case would go red rather than quietly widen.
-    CUSTODY_MASTER_SECRET: SECRET,
-    CUSTODY_MASTER_SECRET_VX: SECRET,
+    CUSTODY_MASTER_SECRET: REFUSED_SHAPE,
+    CUSTODY_MASTER_SECRET_VX: REFUSED_SHAPE,
   })
   assert.deepEqual([...secrets.keys()].sort((a, b) => a - b), [1, 2, 17])
 })
