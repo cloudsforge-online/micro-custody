@@ -148,7 +148,7 @@ test('an exported mnemonic actually re-derives the address it was exported for',
 
   assert.equal(redeemed.value.material.split(' ').length, 24)
   assert.equal(redeemed.value.derivationPath, "m/44'/1'/0'/0/0")
-  const rederived = deriveKey(seedFromMnemonic(redeemed.value.material), 'evm', 'testnet', 0)
+  const rederived = deriveKey(seedFromMnemonic(redeemed.value.material), 'evm', 'testnet', 0, 'ethereum')
   assert.equal(rederived.address, address)
 })
 

@@ -202,13 +202,13 @@ export async function provisionAddress(deps: KeyDeps, input: ProvisionRequest): 
           const seed = await ensureSeed(deps, tx, input.userId, family)
           const index = await takeNextIndex(tx, seed.id)
           const mnemonic = deps.keyring.decrypt(seedSlot(seed.id), await deps.vault.read(seedSlot(seed.id)))
-          const derived = deriveKey(seedFromMnemonic(mnemonic), family, input.network, index)
+          const derived = deriveKey(seedFromMnemonic(mnemonic), family, input.network, index, input.chain)
           seedId = seed.id
           derivationPath = derived.derivationPath
           address = derived.address
           privateKey = derived.privateKey
         } else {
-          const flat = generateFlatRandom(family, input.network)
+          const flat = generateFlatRandom(family, input.network, input.chain)
           address = flat.address
           privateKey = flat.privateKey
         }
@@ -685,7 +685,10 @@ async function produceSignature(
     case 'bitcoin': {
       const shape = bitcoinShapeForPurpose(row.purpose)
       const policy: BitcoinPolicy = shape === 'sweep' ? { shape, treasuryPin: ctx.treasuryPin } : { shape }
-      return wrap(shape, signBitcoin(privateKey, payload, row.address, ctx.network, policy))
+      // `row.chain` and never the family: Litecoin and Bitcoin share the family and differ in
+      // every network parameter that matters. The row is the authority — it is what custody minted
+      // the key under, and it is what the WIF's version byte was chosen from.
+      return wrap(shape, signBitcoin(privateKey, payload, row.address, ctx.network, policy, row.chain))
     }
     case 'xrp':
       // `shapeForRow` deliberately records the FAMILY name for XRP rather than a policy shape,

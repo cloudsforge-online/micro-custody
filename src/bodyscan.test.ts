@@ -399,6 +399,11 @@ function routeSamples(): Sample[] {
       token: 'wallet',
       expect: 200,
     },
+    // The token allowlist, on the same read surface as the pin and under the same scope. Driven
+    // here because SD-16's scan is only a proof about the surface if it covers ALL of it — and the
+    // route-table assertion below is what makes forgetting to add a sample a failing test rather
+    // than a quietly smaller scan.
+    { method: 'GET', route: '/v1/token-contracts', token: 'wallet', expect: 200 },
     {
       method: 'POST',
       route: '/v1/sign',

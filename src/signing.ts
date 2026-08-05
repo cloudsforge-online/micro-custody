@@ -884,9 +884,20 @@ export function signBitcoin(
   address: string,
   network: KeyNetwork,
   policy: BitcoinPolicy,
+  /**
+   * The chain NAME, from the row — `bitcoin` or `litecoin`.
+   *
+   * **NOT DERIVABLE FROM THE FAMILY**, which is `'bitcoin'` for both. It selects the network
+   * parameters, and getting it wrong is not a subtle mispricing: `ECPair.fromWIF` throws outright
+   * when the WIF's version byte disagrees (Litecoin's 176 against Bitcoin's 128), so a Litecoin key
+   * presented under Bitcoin's parameters refuses rather than signing something regrettable. That
+   * throw is the network binding doing its job, and it is why this parameter is required rather
+   * than defaulted.
+   */
+  chain: string,
 ): string {
   if (typeof payload !== 'string') refuse('bitcoin payload must be a base64 PSBT')
-  const net = bitcoinNetwork(network)
+  const net = bitcoinNetwork(chain, network)
 
   // fromWIF throws when the WIF's network byte disagrees, which IS the network binding: a mainnet
   // key can never be used to satisfy a testnet request.

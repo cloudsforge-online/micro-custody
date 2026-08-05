@@ -33,10 +33,19 @@ const url = process.env['CUSTODY_TEST_DATABASE_URL']
 export const enabled = Boolean(url && /test/i.test(url))
 export const skip = enabled ? false : 'set CUSTODY_TEST_DATABASE_URL (name must contain "test")'
 
-/** Every table custody owns. CASCADE, so the order does not matter. */
+/**
+ * Every table custody owns. CASCADE, so the order does not matter.
+ *
+ * **A TABLE MISSING FROM THIS LIST IS A TEST THAT PASSES ONCE.** `custody_token_contracts` was
+ * added by migration 7 and never added here, so the two migration tests that insert into it — the
+ * one-spelling check and the two-networks check — passed on a virgin database and failed with a
+ * 23505 on every run afterwards. That is worse than a plain failure: on a developer's machine it
+ * looks like flakiness, and on CI, which always starts clean, it looks like nothing at all.
+ */
 const ALL_TABLES = [
   'key_exports',
   'signing_audit',
+  'custody_token_contracts',
   'custody_treasuries',
   'custody_keys',
   'custody_seeds',

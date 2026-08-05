@@ -62,6 +62,7 @@ import {
   listKeys,
   listKeysForUser,
   listSigningAudit,
+  listTokenContracts,
   listTreasuryPins,
   outstandingTreasuryCandidate,
   pinTreasury,
@@ -455,6 +456,52 @@ function buildRoutes(): Route[] {
         // The operator's `sub` and the timestamp stay on the admin surface; a peer service needs the
         // address and nothing else.
         return { status: 200, body: { chain, network, address: pin.address } }
+      },
+    },
+
+    /* ---------------------------------------------------------------- token allowlist (read) */
+    {
+      method: 'GET',
+      path: '/v1/token-contracts',
+      /*
+       * THE ALLOWLIST, READ BY THE SERVICE THAT MUST NOT DISAGREE WITH IT.
+       *
+       * `assertTokenSweep` refuses a token sweep whose `to` is not in `custody_token_contracts` for
+       * the row's own (chain, network). `micro-settlement` is the caller that builds those sweeps,
+       * and if it holds its own copy of the list — a config file, an env var, a table of its own —
+       * then the day the two disagree is a sweep built, committed, and 403'd AFTER the chain's
+       * single outbound slot has been claimed, with a `shape_refused` that says nothing about which
+       * side is stale. So there is one list and this is how the other side reads it.
+       *
+       * **READ, AND ONLY READ**, for the treasury pin's reason stated one route above. Registering
+       * a token is `PUT /v1/admin/token-contracts` under an operator's token: a signing credential
+       * that could add to this allowlist could register a contract of its own and make a customer's
+       * deposit key execute it, which is the precise capability the allowlist exists to bound.
+       *
+       * `custody:treasury:read` rather than a scope of its own. The two answer the same question —
+       * "what has an operator configured this vault to permit" — they are read by the same caller
+       * for the same purpose in the same pass, and a new scope would have to be registered,
+       * granted and deployed before a single token could be swept. Reusing it widens nothing: every
+       * holder of it can already read the pin, which is the more sensitive of the two.
+       */
+      handle: async (ctx, deps) => {
+        const principal = await authenticate(ctx, deps)
+        if (principal.kind === 'service') requireScope(principal, TREASURY_READ_SCOPE)
+        const rows = await listTokenContracts(deps.keys.sql)
+        // `set_by` and `set_at` stay on the admin surface. A peer needs what to call and what it is
+        // denominated in; who registered it is an operator's audit question.
+        return {
+          status: 200,
+          body: {
+            tokens: rows.map((row) => ({
+              chain: row.chain,
+              network: row.network,
+              contract: row.contract,
+              symbol: row.symbol,
+              decimals: row.decimals,
+            })),
+          },
+        }
       },
     },
 

@@ -38,6 +38,7 @@ export const ECPair = ECPairFactory(ecc)
 const CHAIN_ASSET: Readonly<Record<string, AssetCode | null>> = Object.freeze({
   ethereum: 'ETH',
   bitcoin: 'BTC',
+  litecoin: 'LTC',
   solana: 'SOL',
   xrp: 'XRP',
   ember: 'EMBER',
@@ -79,9 +80,93 @@ export function expectedEvmChainId(chain: string, network: KeyNetwork): number |
   return chainSpec(asset).chainId?.[network] ?? null
 }
 
-/** bitcoinjs network for a key network. The WIF carries this, so it is checked on decrypt. */
-export function bitcoinNetwork(network: KeyNetwork): bitcoin.Network {
-  return network === 'mainnet' ? bitcoin.networks.bitcoin : bitcoin.networks.testnet
+/**
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * LITECOIN'S NETWORK PARAMETERS. **A WRONG BYTE HERE LOSES CUSTOMER MONEY SILENTLY.**
+ *
+ * `bitcoinjs-lib` ships `networks.bitcoin` and `networks.testnet` and nothing else, so a
+ * Litecoin address derived with Bitcoin's parameters is a `bc1…` address that a user is told to
+ * send LTC to. That is the failure mode this whole block exists to prevent, and it is the worst
+ * kind: the address is well-formed, the checksum is valid, nothing errors, and the WIF the key is
+ * stored under carries Bitcoin's version byte so the sweep cannot be signed either.
+ *
+ * Every value below is from `litecoin-project/litecoin`, `src/chainparams.cpp`, and each is
+ * commented with what it produces so a reader can check it against an address rather than against
+ * a memory.
+ *
+ * **TWO CORRECTIONS TO WHAT "EVERYONE KNOWS", both verified against Core rather than assumed:**
+ *
+ *  1. **The BIP-32 version bytes are Bitcoin's**, `0x0488b21e` / `0x0488ade4` — `xpub` and `xprv`.
+ *     The widely-quoted `Ltub`/`Ltpv` pair (`0x019da462` / `0x019d9cfe`) is **SLIP-0132**, a wallet
+ *     DISPLAY convention, and Litecoin Core has used `xpub`/`xprv` in every tag from v0.13.2 to
+ *     v0.21.4. It makes no difference to a derived address — these bytes only appear when an
+ *     extended key is serialised, which this service never does — but putting SLIP-0132's values
+ *     here would make any future xpub export disagree with Core.
+ *  2. **Litecoin has TWO P2SH prefixes.** `SCRIPT_ADDRESS` is 5 (`3…`, shared with Bitcoin) and
+ *     `SCRIPT_ADDRESS2` is 50 (`M…`). `key_io.cpp` ENCODES with 50 and DECODES both, so 50 is the
+ *     right value to generate under. It is recorded for completeness only: this service derives
+ *     P2WPKH and never a P2SH address.
+ *
+ * Native segwit is safe to derive: Litecoin activated segwit at block 1,201,536 (May 2017) and
+ * Core's `DEFAULT_ADDRESS_TYPE` is `OutputType::BECH32`, so `ltc1q…` is what a Litecoin wallet
+ * produces by default and what every major exchange accepts.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+const LITECOIN_MAINNET: bitcoin.Network = Object.freeze({
+  messagePrefix: '\x19Litecoin Signed Message:\n',
+  // xpub / xprv — Core's, not SLIP-0132's Ltub/Ltpv. See the note above.
+  bip32: { public: 0x0488b21e, private: 0x0488ade4 },
+  /** `ltc1q…`. The HRP is the single most visible difference from Bitcoin's `bc1q…`. */
+  bech32: 'ltc',
+  /** 48 → a legacy address beginning `L`. */
+  pubKeyHash: 0x30,
+  /** 50 → `M`. Core encodes with this and decodes 5 as well. Unused here; P2WPKH only. */
+  scriptHash: 0x32,
+  /** 176 → a compressed WIF beginning `T`. Bitcoin's 128 gives `K`/`L`, so a mix-up is visible. */
+  wif: 0xb0,
+})
+
+const LITECOIN_TESTNET: bitcoin.Network = Object.freeze({
+  messagePrefix: '\x19Litecoin Signed Message:\n',
+  // tpub / tprv — Core's. SLIP-0132's `ttub` pair is 0x0436f6e1 / 0x0436ef7d.
+  bip32: { public: 0x043587cf, private: 0x04358394 },
+  /** `tltc1q…` — distinct from Bitcoin testnet's `tb1q…`. */
+  bech32: 'tltc',
+  pubKeyHash: 0x6f,
+  /** 58 → the SCRIPT_ADDRESS2 value; Core also decodes 196. */
+  scriptHash: 0x3a,
+  wif: 0xef,
+})
+
+const BITCOIN_FAMILY_NETWORKS: Readonly<Record<string, Readonly<Record<KeyNetwork, bitcoin.Network>>>> =
+  Object.freeze({
+    bitcoin: { mainnet: bitcoin.networks.bitcoin, testnet: bitcoin.networks.testnet },
+    litecoin: { mainnet: LITECOIN_MAINNET, testnet: LITECOIN_TESTNET },
+  })
+
+/**
+ * bitcoinjs network for a (chain, network). The WIF carries it, so it is checked on decrypt.
+ *
+ * **THE CHAIN IS A PARAMETER AND IT USED NOT TO BE**, which is the whole of the Litecoin fix.
+ * `ChainFamily` for LTC is `'bitcoin'` — Litecoin really does share Bitcoin's transaction and
+ * script structure, which is why one adapter serves both — so a function taking only the family
+ * cannot tell them apart and answered Bitcoin's parameters for Litecoin. The result was a `bc1…`
+ * address published as a Litecoin deposit address.
+ *
+ * **IT THROWS FOR AN UNKNOWN CHAIN RATHER THAN DEFAULTING TO BITCOIN.** A default here is the exact
+ * bug being fixed, one family later: the next Bitcoin-derived chain added to `CHAIN_ASSET` would
+ * silently mint Bitcoin addresses under its own name, and nothing would fail until somebody sent
+ * money. Failing at derivation time costs an obvious error; failing silently costs the deposit.
+ */
+export function bitcoinNetwork(chain: string, network: KeyNetwork): bitcoin.Network {
+  const params = BITCOIN_FAMILY_NETWORKS[chain]
+  if (!params) {
+    throw new Error(
+      `no bitcoin-family network parameters are defined for '${chain}' — refusing to derive an ` +
+        'address with another chain parameters, which would be a valid address on the wrong chain',
+    )
+  }
+  return params[network]
 }
 
 export interface GeneratedKey {
@@ -102,7 +187,18 @@ export interface GeneratedKey {
  * `scheme: 'flat_random'` explicitly, which exists so the legacy path is exercised by tests rather
  * than only by rows nobody can create any more.
  */
-export function generateFlatRandom(family: KeyFamily, network: KeyNetwork): GeneratedKey {
+export function generateFlatRandom(
+  family: KeyFamily,
+  network: KeyNetwork,
+  /**
+   * The CHAIN, not just the family, and only the bitcoin family reads it.
+   *
+   * Litecoin's family is `'bitcoin'`, so the family alone cannot select its network parameters —
+   * see `bitcoinNetwork`. Required rather than optional: a default would be Bitcoin's, which is
+   * precisely the wrong answer for every bitcoin-family chain that is not Bitcoin.
+   */
+  chain: string,
+): GeneratedKey {
   switch (family) {
     case 'evm':
     case 'ember': {
@@ -117,7 +213,7 @@ export function generateFlatRandom(family: KeyFamily, network: KeyNetwork): Gene
       }
     }
     case 'bitcoin': {
-      const net = bitcoinNetwork(network)
+      const net = bitcoinNetwork(chain, network)
       const keyPair = ECPair.makeRandom({ network: net })
       const { address } = bitcoin.payments.p2wpkh({ pubkey: Buffer.from(keyPair.publicKey), network: net })
       // The WIF carries the network flag, so a later decrypt-and-sign stays unambiguous: a mainnet

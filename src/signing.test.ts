@@ -506,7 +506,7 @@ test('Solana: createAccount may only allocate an SPL mint account', () => {
 
 /* ------------------------------------------------------------------ Bitcoin */
 
-const btcNetwork = bitcoinNetwork('testnet')
+const btcNetwork = bitcoinNetwork('bitcoin', 'testnet')
 const btcKey = ECPair.makeRandom({ network: btcNetwork })
 const btcPayment = bitcoin.payments.p2wpkh({ pubkey: Buffer.from(btcKey.publicKey), network: btcNetwork })
 const foreignKey = ECPair.makeRandom({ network: btcNetwork })
@@ -540,7 +540,7 @@ function psbt(options: PsbtOptions = {}): string {
 }
 
 test('Bitcoin: a PSBT spending this address is signed and finalised', () => {
-  const hex = signBitcoin(btcKey.toWIF(), psbt(), btcPayment.address!, 'testnet', BTC_PAYMENT)
+  const hex = signBitcoin(btcKey.toWIF(), psbt(), btcPayment.address!, 'testnet', BTC_PAYMENT, 'bitcoin')
   assert.match(hex, /^[0-9a-f]+$/)
 })
 
@@ -549,14 +549,14 @@ test('Bitcoin: a PSBT with a FOREIGN input is refused', () => {
   // own coins. `signAllInputs` signs all of them, so one foreign input would be signed too.
   assert.throws(
     () =>
-      signBitcoin(btcKey.toWIF(), psbt({ script: foreignPayment.output! }), btcPayment.address!, 'testnet', BTC_PAYMENT),
+      signBitcoin(btcKey.toWIF(), psbt({ script: foreignPayment.output! }), btcPayment.address!, 'testnet', BTC_PAYMENT, 'bitcoin'),
     (err: unknown) => err instanceof SignRefused && /does not spend this vault address/.test((err as Error).message),
   )
 })
 
 test('Bitcoin: an input with no witnessUtxo is refused — its value is unknown', () => {
   assert.throws(
-    () => signBitcoin(btcKey.toWIF(), psbt({ noWitnessUtxo: true }), btcPayment.address!, 'testnet', BTC_PAYMENT),
+    () => signBitcoin(btcKey.toWIF(), psbt({ noWitnessUtxo: true }), btcPayment.address!, 'testnet', BTC_PAYMENT, 'bitcoin'),
     (err: unknown) => err instanceof SignRefused && /its value is unknown/.test((err as Error).message),
   )
 })
@@ -570,6 +570,7 @@ test('Bitcoin: anything but SIGHASH_ALL is refused — it leaves the rest of the
         btcPayment.address!,
         'testnet',
         BTC_PAYMENT,
+        'bitcoin',
       ),
     (err: unknown) => err instanceof SignRefused && /only SIGHASH_ALL is signed/.test((err as Error).message),
   )
@@ -577,21 +578,21 @@ test('Bitcoin: anything but SIGHASH_ALL is refused — it leaves the rest of the
 
 test('Bitcoin: a raw transaction is refused — only a PSBT carries each input value', () => {
   assert.throws(
-    () => signBitcoin(btcKey.toWIF(), { version: 2 }, btcPayment.address!, 'testnet', BTC_PAYMENT),
+    () => signBitcoin(btcKey.toWIF(), { version: 2 }, btcPayment.address!, 'testnet', BTC_PAYMENT, 'bitcoin'),
     (err: unknown) => err instanceof SignRefused && /must be a base64 PSBT/.test((err as Error).message),
   )
 })
 
 test('Bitcoin: the WIF carries the network, so a mainnet key cannot satisfy a testnet request', () => {
-  const mainnetKey = ECPair.makeRandom({ network: bitcoinNetwork('mainnet') })
+  const mainnetKey = ECPair.makeRandom({ network: bitcoinNetwork('bitcoin', 'mainnet') })
   // Not a SignRefused: a key that does not match the row is a fault in here, not the caller's fault.
-  assert.throws(() => signBitcoin(mainnetKey.toWIF(), psbt(), btcPayment.address!, 'testnet', BTC_PAYMENT))
+  assert.throws(() => signBitcoin(mainnetKey.toWIF(), psbt(), btcPayment.address!, 'testnet', BTC_PAYMENT, 'bitcoin'))
 })
 
 /* ---------------------------------------------- Bitcoin: the sweep output policy */
 
 test('SD-09 §4 — a BTC sweep paying only the pin is signed', () => {
-  const hex = signBitcoin(btcKey.toWIF(), psbt({ outputs: [btcTreasury.output!] }), btcPayment.address!, 'testnet', BTC_SWEEP)
+  const hex = signBitcoin(btcKey.toWIF(), psbt({ outputs: [btcTreasury.output!] }), btcPayment.address!, 'testnet', BTC_SWEEP, 'bitcoin')
   assert.match(hex, /^[0-9a-f]+$/)
 })
 
@@ -599,7 +600,7 @@ test('SD-09 §4 — a BTC sweep to anything but the pin is refused', () => {
   // The same PSBT the payment tests sign happily. `purpose` selects the policy, so the identical
   // bytes are a withdrawal from a treasury and a refusal from a deposit address.
   assert.throws(
-    () => signBitcoin(btcKey.toWIF(), psbt(), btcPayment.address!, 'testnet', BTC_SWEEP),
+    () => signBitcoin(btcKey.toWIF(), psbt(), btcPayment.address!, 'testnet', BTC_SWEEP, 'bitcoin'),
     (err: unknown) =>
       err instanceof SignRefused && /psbt output 0 does not pay the treasury address pinned/.test((err as Error).message),
   )
@@ -616,7 +617,7 @@ test('SD-09 §4 — a BTC sweep with a CHANGE output is refused whole, not parti
     [btcPayment.output!, btcTreasury.output!],
   ]) {
     assert.throws(
-      () => signBitcoin(btcKey.toWIF(), psbt({ outputs }), btcPayment.address!, 'testnet', BTC_SWEEP),
+      () => signBitcoin(btcKey.toWIF(), psbt({ outputs }), btcPayment.address!, 'testnet', BTC_SWEEP, 'bitcoin'),
       (err: unknown) => err instanceof SignRefused && /every output of a sweep pays the pin, change included/.test((err as Error).message),
     )
   }
@@ -629,23 +630,35 @@ test('SD-09 §4 — a BTC sweep output with no renderable address is refused, no
   // opcode table is index-typed and `noUncheckedIndexedAccess` makes every entry `| undefined`.
   const opReturn = Buffer.from('6a046275726e', 'hex')
   assert.throws(
-    () => signBitcoin(btcKey.toWIF(), psbt({ outputs: [btcTreasury.output!, opReturn] }), btcPayment.address!, 'testnet', BTC_SWEEP),
+    () =>
+      signBitcoin(
+        btcKey.toWIF(),
+        psbt({ outputs: [btcTreasury.output!, opReturn] }),
+        btcPayment.address!,
+        'testnet',
+        BTC_SWEEP,
+        'bitcoin',
+      ),
     (err: unknown) => err instanceof SignRefused && /psbt output 1 does not pay the treasury/.test((err as Error).message),
   )
 })
 
 test('SD-09 §4 — a BTC sweep with no pin, or a pin from the wrong network, is refused rather than defaulted', () => {
   const mainnetTreasury = bitcoin.payments.p2wpkh({
-    pubkey: Buffer.from(ECPair.makeRandom({ network: bitcoinNetwork('mainnet') }).publicKey),
-    network: bitcoinNetwork('mainnet'),
+    pubkey: Buffer.from(ECPair.makeRandom({ network: bitcoinNetwork('bitcoin', 'mainnet') }).publicKey),
+    network: bitcoinNetwork('bitcoin', 'mainnet'),
   })
   for (const pin of ['', 'not-an-address', mainnetTreasury.address!]) {
     assert.throws(
       () =>
-        signBitcoin(btcKey.toWIF(), psbt({ outputs: [btcTreasury.output!] }), btcPayment.address!, 'testnet', {
-          shape: 'sweep',
-          treasuryPin: pin,
-        }),
+        signBitcoin(
+          btcKey.toWIF(),
+          psbt({ outputs: [btcTreasury.output!] }),
+          btcPayment.address!,
+          'testnet',
+          { shape: 'sweep', treasuryPin: pin },
+          'bitcoin',
+        ),
       (err: unknown) => err instanceof SignRefused && /no usable treasury is pinned/.test((err as Error).message),
       `pin ${JSON.stringify(pin)} was not refused`,
     )
@@ -670,14 +683,14 @@ test('SD-09 §4 — a BTC sweep may not burn the deposit as FEE, even paying onl
   const greedy = p.toBase64()
 
   assert.throws(
-    () => signBitcoin(btcKey.toWIF(), greedy, btcPayment.address!, 'testnet', BTC_SWEEP),
+    () => signBitcoin(btcKey.toWIF(), greedy, btcPayment.address!, 'testnet', BTC_SWEEP, 'bitcoin'),
     (err: unknown) =>
       err instanceof SignRefused && /pays 2727 sat\/vB in fee, above the 1000/.test((err as Error).message),
   )
   // And it is a REFUSAL, not the bare Error bitcoinjs throws — a 500 writes no audit row, and the
   // rate limiter counts audit rows, so an unaudited path is one a caller can probe without limit.
   // The same PSBT under the payment shape is signed: a treasury's residual is SDR-05, not this.
-  assert.match(signBitcoin(btcKey.toWIF(), greedy, btcPayment.address!, 'testnet', BTC_PAYMENT), /^[0-9a-f]+$/)
+  assert.match(signBitcoin(btcKey.toWIF(), greedy, btcPayment.address!, 'testnet', BTC_PAYMENT, 'bitcoin'), /^[0-9a-f]+$/)
 })
 
 test('the output policy runs BEFORE anything is signed — a refused sweep produces no signature', () => {
@@ -685,7 +698,7 @@ test('the output policy runs BEFORE anything is signed — a refused sweep produ
   // after the refusal, so nothing was written into it on the way out.
   const before = psbt({ outputs: [foreignPayment.output!] })
   try {
-    signBitcoin(btcKey.toWIF(), before, btcPayment.address!, 'testnet', BTC_SWEEP)
+    signBitcoin(btcKey.toWIF(), before, btcPayment.address!, 'testnet', BTC_SWEEP, 'bitcoin')
     assert.fail('expected a refusal')
   } catch (err) {
     assert.ok(err instanceof SignRefused)
@@ -984,4 +997,124 @@ test('§5.2 the gas problem: the DEPOSIT key still cannot move native value to f
     }),
   )
   assert.match(message, /a sweep does not choose its own destination/)
+})
+
+/* ══════════════════════════════════════════════════════════════════════════════════════════════
+ * LITECOIN SIGNING — the other half of the derivation fix.
+ *
+ * Deriving a genuine `ltc1…` address is worth nothing if the key cannot then be SIGNED with, and
+ * the two are resolved by different parameters in different files: `hd.ts` picks them to derive,
+ * `signing.ts` picks them to sign. If the signer resolved them from the FAMILY — which is
+ * `'bitcoin'` for Litecoin — every LTC sweep would be refused by `ECPair.fromWIF` and the deposits
+ * would be unspendable. Custody is where that mistake is unrecoverable.
+ *
+ * So this drives a whole Litecoin PSBT through the real `signBitcoin`, under both shapes, and
+ * asserts the cross-chain cases refuse rather than sign.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+
+const ltcNetwork = bitcoinNetwork('litecoin', 'testnet')
+const ltcKey = ECPair.makeRandom({ network: ltcNetwork })
+const ltcPayment = bitcoin.payments.p2wpkh({ pubkey: Buffer.from(ltcKey.publicKey), network: ltcNetwork })
+const ltcTreasuryKey = ECPair.makeRandom({ network: ltcNetwork })
+const ltcTreasury = bitcoin.payments.p2wpkh({
+  pubkey: Buffer.from(ltcTreasuryKey.publicKey),
+  network: ltcNetwork,
+})
+
+function ltcPsbt(outputs: readonly Buffer[]): string {
+  const p = new bitcoin.Psbt({ network: ltcNetwork })
+  p.addInput({
+    hash: Buffer.alloc(32, 9),
+    index: 0,
+    witnessUtxo: { script: ltcPayment.output!, value: 100_000 },
+  })
+  for (const script of outputs) p.addOutput({ script, value: Math.floor(90_000 / outputs.length) })
+  return p.toBase64()
+}
+
+test('LITECOIN: a sweep of a Litecoin deposit address signs under the row own chain', () => {
+  const signed = signBitcoin(
+    ltcKey.toWIF(),
+    ltcPsbt([ltcTreasury.output!]),
+    ltcPayment.address!,
+    'testnet',
+    { shape: 'sweep', treasuryPin: ltcTreasury.address! },
+    'litecoin',
+  )
+  // A finalised raw transaction, which is what the caller broadcasts. Decoding it back proves the
+  // signature was really produced rather than an empty PSBT returned.
+  const tx = bitcoin.Transaction.fromHex(signed)
+  assert.equal(tx.ins.length, 1)
+  assert.ok(tx.ins[0]!.witness.length > 0, 'the input must carry a witness')
+})
+
+test('LITECOIN: the pin is still the vault choice — a foreign output is refused', () => {
+  const foreign = bitcoin.payments.p2wpkh({
+    pubkey: Buffer.from(ECPair.makeRandom({ network: ltcNetwork }).publicKey),
+    network: ltcNetwork,
+  })
+  assert.throws(
+    () =>
+      signBitcoin(
+        ltcKey.toWIF(),
+        ltcPsbt([foreign.output!]),
+        ltcPayment.address!,
+        'testnet',
+        { shape: 'sweep', treasuryPin: ltcTreasury.address! },
+        'litecoin',
+      ),
+    (err: unknown) => err instanceof SignRefused && /does not pay the treasury/.test((err as Error).message),
+  )
+})
+
+test('LITECOIN: a Litecoin key presented as a Bitcoin one refuses, and the reverse too', () => {
+  /*
+   * **THE MUTATION THIS TEST EXISTS FOR.** Hard-coding `'bitcoin'` at the signer's call site — the
+   * shape the code had before the chain was threaded through — makes every Litecoin sweep refuse.
+   * That is the SAFE direction of the failure and it is still a total outage of the LTC on-ramp,
+   * so it has to be a red test rather than a support ticket.
+   *
+   * It throws rather than refusing, and that distinction is deliberate: `ECPair.fromWIF` failing is
+   * a fault in this service's own wiring, not a caller's malformed request, so it must not be
+   * dressed up as a 403 the caller could think they caused.
+   */
+  assert.throws(() =>
+    signBitcoin(
+      ltcKey.toWIF(),
+      ltcPsbt([ltcTreasury.output!]),
+      ltcPayment.address!,
+      'testnet',
+      { shape: 'sweep', treasuryPin: ltcTreasury.address! },
+      'bitcoin',
+    ),
+  )
+  assert.throws(() =>
+    signBitcoin(
+      btcKey.toWIF(),
+      psbt({ outputs: [btcTreasury.output!] }),
+      btcPayment.address!,
+      'testnet',
+      BTC_SWEEP,
+      'litecoin',
+    ),
+  )
+})
+
+test('LITECOIN: a Bitcoin treasury pinned against a Litecoin row is refused, not matched', () => {
+  // `assertSweepOutputs` turns the pin into an output script under the ROW's network. A pin from
+  // another chain must throw there — if it silently matched nothing, every output would be "not the
+  // pin" and the refusal would read as a caller error rather than a misconfiguration.
+  assert.throws(
+    () =>
+      signBitcoin(
+        ltcKey.toWIF(),
+        ltcPsbt([ltcTreasury.output!]),
+        ltcPayment.address!,
+        'testnet',
+        { shape: 'sweep', treasuryPin: btcTreasury.address! },
+        'litecoin',
+      ),
+    (err: unknown) => err instanceof SignRefused && /no usable treasury is pinned/.test((err as Error).message),
+  )
 })

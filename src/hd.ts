@@ -54,6 +54,23 @@ const COIN_TYPE: Readonly<Record<KeyFamily, number>> = Object.freeze({
   xrp: 144,
 })
 
+/**
+ * Coin types that belong to a CHAIN rather than to a family, and override the family's.
+ *
+ * **LITECOIN IS SLIP-0044 COIN TYPE 2 AND ITS FAMILY IS `'bitcoin'`, WHICH IS 0.** Without this
+ * table an LTC key derives at `m/44'/0'/0'/0/i` — Bitcoin's path — so a user's Litecoin key and
+ * their Bitcoin key are drawn from one keyspace, and a recovery phrase exported from here restores
+ * the Litecoin funds nowhere any Litecoin wallet would look for them. That is a silent loss on
+ * restore rather than at derivation, which makes it the worse half of the bug: the address works,
+ * the deposit arrives, the sweep signs, and only a user recovering from their phrase finds out.
+ *
+ * Keyed by CHAIN NAME and consulted before the family, so adding a bitcoin-family chain without
+ * its own coin type is a decision somebody has to make rather than a default they inherit.
+ */
+const CHAIN_COIN_TYPE: Readonly<Record<string, number>> = Object.freeze({
+  litecoin: 2,
+})
+
 const TESTNET_COIN_TYPE = 1
 
 /** Families whose keys are ed25519 and therefore derive under SLIP-0010, not BIP-32. */
@@ -61,8 +78,11 @@ function isEd25519(family: KeyFamily): boolean {
   return family === 'solana'
 }
 
-export function coinTypeFor(family: KeyFamily, network: KeyNetwork): number {
-  return network === 'mainnet' ? COIN_TYPE[family] : TESTNET_COIN_TYPE
+export function coinTypeFor(family: KeyFamily, network: KeyNetwork, chain: string): number {
+  // Testnet is 1 for EVERY coin — SLIP-0044's own entry — and that is the network-binding property
+  // the file header describes, so it is checked before anything chain-specific.
+  if (network !== 'mainnet') return TESTNET_COIN_TYPE
+  return CHAIN_COIN_TYPE[chain] ?? COIN_TYPE[family]
 }
 
 /**
@@ -72,8 +92,13 @@ export function coinTypeFor(family: KeyFamily, network: KeyNetwork): number {
  * the Solana path ends `…/<index>'/0'` rather than `…/0'/0/<index>`. That is the shape the Solana
  * CLI and every Solana wallet already use, so an exported phrase restores where a user expects.
  */
-export function derivationPath(family: KeyFamily, network: KeyNetwork, index: number): string {
-  const coin = coinTypeFor(family, network)
+export function derivationPath(
+  family: KeyFamily,
+  network: KeyNetwork,
+  index: number,
+  chain: string,
+): string {
+  const coin = coinTypeFor(family, network, chain)
   if (isEd25519(family)) return `m/44'/${coin}'/${index}'/0'`
   return `m/44'/${coin}'/0'/0/${index}`
 }
@@ -165,8 +190,16 @@ export function deriveKey(
   family: KeyFamily,
   network: KeyNetwork,
   index: number,
+  /**
+   * The chain NAME. Two families read it and both would be silently wrong without it.
+   *
+   * `bitcoin` needs it to pick network parameters — Litecoin's family is `'bitcoin'`, so the family
+   * alone cannot distinguish `ltc1q…` from `bc1q…`. The BIP-44 coin type needs it for the same
+   * reason: LTC is 2 and BTC is 0, and a shared family would have shared a keyspace.
+   */
+  chain: string,
 ): DerivedKey {
-  const path = derivationPath(family, network, index)
+  const path = derivationPath(family, network, index, chain)
 
   if (isEd25519(family)) {
     const node = slip10FromPath(seed, path)
@@ -190,7 +223,7 @@ export function deriveKey(
       return { address: w.address, privateKey: w.privateKey, derivationPath: path }
     }
     case 'bitcoin': {
-      const net = bitcoinNetwork(network)
+      const net = bitcoinNetwork(chain, network)
       const keyPair = ECPair.fromPrivateKey(privBuf, { network: net })
       const { address } = bitcoin.payments.p2wpkh({ pubkey: Buffer.from(keyPair.publicKey), network: net })
       return { address: address!, privateKey: keyPair.toWIF(), derivationPath: path }
