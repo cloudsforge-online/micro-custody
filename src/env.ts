@@ -158,8 +158,9 @@ function requiredGeneratedSecret(source: Source, name: string): string {
  * SCOPE IS NO LONGER "MASTER SECRETS ONLY". This file used to argue that `OUTBOX_SIGNING_SECRET`
  * had to be exempt, because holding custody alone to the strict rule would stop custody booting on a
  * value every peer still accepts. That was true when it was written and is not true now: the estate
- * rotated the outbox key onto generated material (measured on both networks: 64 characters, 32
- * bytes, in one alphabet), and the guard is landing in every service at once rather than in this one.
+ * rotated the outbox key onto generated material (measured on both networks 2026-08-06: 64
+ * characters, base64, 48 BYTES, 5.27 bits per character — `openssl rand -base64 48`), and the guard
+ * is landing in every service at once rather than in this one.
  * The exemption was the last thing keeping the #142 placeholder bootable here, so it is gone.
  */
 
