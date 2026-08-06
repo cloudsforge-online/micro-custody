@@ -14,7 +14,7 @@
  *     ask for it.
  *   * wallet expected a flat body with a `custodyKeyUrn` on it. This route has never sent either —
  *     the body is `{ key: … }` and `CustodyKeyRecord` has no identifier field, because the key
- *     table is keyed by `address` (`migrations.ts:98`) and `04-domain-model.md` §3.3 names no other.
+ *     table is keyed by `address` (`migrations.ts`) and `04-domain-model.md` §3.3 names no other.
  *
  * So the two properties below are the ones a caller in another repository has to be able to rely
  * on, and they are asserted by NAME rather than by a snapshot: a field that disappears must fail
@@ -85,7 +85,7 @@ const create = (body: Record<string, unknown>) =>
   server.request('/v1/addresses', { method: 'POST', token: 'wallet', body })
 
 /**
- * Every field `toKeyRecord` publishes (`store.ts:83-96`), and no others.
+ * Every field `toKeyRecord` publishes (`store.ts`), and no others.
  *
  * Both directions are checked. A field that vanishes breaks a caller reading it; a field that
  * APPEARS is the one that matters most here, because this is the service that holds private keys
@@ -134,11 +134,11 @@ test('THE CONTRACT: the minted key is published under `key`, with exactly these 
   assert.equal(typeof key.derivationPath, 'string')
 
   // NOT published, and the reason is load-bearing: `userId` and `orderId` are the entropy in the
-  // /sign binding (`keys.ts:291`), so serving them under the same credential that signs would make
-  // the binding check circular. A caller must already know them — see `store.ts:57-61`.
+  // /sign binding (`keys.ts`), so serving them under the same credential that signs would make
+  // the binding check circular. A caller must already know them — see `store.ts`.
   assert.equal(key.userId, undefined)
   assert.equal(key.orderId, undefined)
-  // And there is no identifier of any kind. The address IS the identity (`migrations.ts:98`).
+  // And there is no identifier of any kind. The address IS the identity (`migrations.ts`).
   assert.equal(key.id, undefined)
   assert.equal(key.custodyKeyUrn, undefined)
 })
@@ -175,7 +175,7 @@ test('an orderId of whitespace is refused as emptily as an absent one', { skip }
 
 test('THE CONTRACT: network, purpose and scheme default, which is why they were never missed', { skip }, async () => {
   // The asymmetry that hid the defect for the life of the service. These three are `enumField`
-  // with a fallback (`server.ts:350-352`); `chain`, `userId` and `orderId` are `stringField` with
+  // with a fallback (`server.ts`); `chain`, `userId` and `orderId` are `stringField` with
   // none. A caller that omitted all six would be told about exactly the three that matter.
   const response = await create({ chain: 'ember', userId: ALICE, orderId: 'an-assignment-id' })
   assert.equal(response.status, 201, response.text)
@@ -187,7 +187,7 @@ test('THE CONTRACT: network, purpose and scheme default, which is why they were 
 
 test('the binding is stored as sent, because a sweep has to restate it character for character', { skip }, async () => {
   // wallet sends its deposit assignment id here and settlement restates it to sweep the address
-  // (`settlement/src/server.ts:739`). Whatever arrives must be what is stored: a trim is fine, a
+  // (`settlement/src/server.ts`). Whatever arrives must be what is stored: a trim is fine, a
   // normalisation would silently break every future signature for the address.
   const orderId = '0199a3f0-7c2a-7000-8000-0000000000ab'
   const response = await create({
@@ -227,7 +227,7 @@ test('THE CONTRACT: a repeated request returns the ORIGINAL address, and says it
    * does not dedupe", and it passed: `provisionAddress` minted unconditionally and the
    * `idempotency-key` header was not read anywhere, while wallet's client documented "Custody
    * returns the same address for the same key" and mint's still says "Idempotent on (chain,
-   * network, userId, orderId)" (`mint/src/custodyclient.ts:124`). Two callers believed a property
+   * network, userId, orderId)" (`mint/src/custodyclient.ts`). Two callers believed a property
    * this service had never had. It said of itself: "THE DAY THIS TEST STARTS FAILING IS THE DAY
    * CUSTODY GAINED IDEMPOTENCY", and that day is what this rewrite records.
    *

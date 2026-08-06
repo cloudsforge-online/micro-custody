@@ -22,7 +22,7 @@
  * `CUSTODY_TOKEN` IS ALSO DELIBERATELY ABSENT, and it is worth saying so rather than leaving the
  * next reader to rediscover it. That variable exists — `deploy/compose/docker-compose.estate.yml`
  * sets it on `faucet` and `faucet-migrate`, fed from `FAUCET_CUSTODY_TOKEN` — but it belongs to
- * micro-faucet, which READS it (`faucet/src/env.ts:400`) and PRESENTS it to this service as a
+ * micro-faucet, which READS it (`faucet/src/env.ts`) and PRESENTS it to this service as a
  * bearer. Custody is the audience, not the holder: it verifies whatever arrives against the JWKS at
  * `IDENTITY_JWKS_URL`, so it needs no copy of the token and must never be given one. Declaring it
  * here would put it in the manifest rule 9 derives from this file, and a service that is handed a
@@ -282,7 +282,7 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
   return {
     // 4005, not 4008. micro-indexer also binds 4008, so the two could not run together on one
     // machine — and the registry has said 4005 for this service all along: `keyvault`, "Custodial
-    // key service" (`ui/packages/ui/src/surfaces.ts:537-542`). The indexer keeps 4008 because four
+    // key service" (`ui/packages/ui/src/surfaces.ts`). The indexer keeps 4008 because four
     // consumers name it (mint, foresight and market via INDEXER_URL, plus the explorer surface),
     // where only micro-faucet names custody's.
     port: integer(source, 'PORT', 4005, 1, 65_535),

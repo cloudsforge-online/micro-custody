@@ -457,7 +457,7 @@ function solSweepTx(from: string, to: string): string {
  * one case then relied on custody minting a second address for a binding it had already minted —
  * which it did, because it had no idempotency at all. Migration 6 makes that a replay, so a fixture
  * that wants a SECOND address now has to ask for one the way wallet does: a new assignment id per
- * address (`wallet/src/deposits.ts:196`). The cases below need a stranger address to prove a sweep
+ * address (`wallet/src/deposits.ts`). The cases below need a stranger address to prove a sweep
  * cannot pay it, and a stranger that is the same address proves nothing.
  */
 let depositOrdinal = 0

@@ -102,8 +102,8 @@ export type ProvisionResult =
  * The purposes whose binding names exactly one address, and may therefore be deduplicated by it.
  *
  * `deposit` and `deployer` take their `orderId` from a row the caller creates once per address it
- * intends to exist — wallet's deposit assignment id (`wallet/src/deposits.ts:196`) and mint's token
- * id (`mint/src/deploy.ts:179`). A second key under one of those bindings is a duplicate mint by
+ * intends to exist — wallet's deposit assignment id (`wallet/src/deposits.ts`) and mint's token
+ * id (`mint/src/deploy.ts`). A second key under one of those bindings is a duplicate mint by
  * definition, and a rotation is safe because a rotation is a new assignment with a new id.
  *
  * `treasury` is excluded and its exclusion is the load-bearing half: `treasuryBinding` derives the
@@ -283,9 +283,9 @@ export async function provisionAddress(deps: KeyDeps, input: ProvisionRequest): 
  * ── AND A KEY THAT MATCHES A DIFFERENT REQUEST IS A CONFLICT, NOT A REPLAY ───────────────────
  *
  * This is the case where being helpful would be dangerous. `orderId` is one of SD-09's five
- * binding fields (`gates.ts:182`) and settlement must restate it character for character to sweep
+ * binding fields (`gates.ts`) and settlement must restate it character for character to sweep
  * the address — "a guessed binding is a sweep refused every tick for ever"
- * (`settlement/src/server.ts:739`). Handing back an address bound to a DIFFERENT order because the
+ * (`settlement/src/server.ts`). Handing back an address bound to a DIFFERENT order because the
  * caller reused a key would file that address under a binding this service never stored, and every
  * sweep of it would be refused for the life of the platform. The 409 costs a caller one retry.
  */

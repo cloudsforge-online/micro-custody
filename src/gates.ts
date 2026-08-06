@@ -199,7 +199,7 @@ export function purposeGate(row: Pick<RowIdentity, 'purpose' | 'family' | 'statu
  *
  * SD-09 names the five: `address`, `chain`, `network`, `userId`, `orderId`. **`userId` is the one
  * that is new.** In forge-keyvault `row.userId` was compared to nothing at all — the code comment
- * at `routes/vault.ts:303` said so — because the only credential reaching /sign was a shared service
+ * at `routes/vault.ts` said so — because the only credential reaching /sign was a shared service
  * token that could not distinguish one user from another. With scoped service identity (SD-05) the
  * caller now states whose key it is acting on, so the field that was decorative becomes a check: a
  * caller that has learned one address cannot sign for it while claiming a different customer, and a

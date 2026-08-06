@@ -43,7 +43,7 @@ export interface DomainEvent {
    * Ordering is per `(topic, key)` only. Choose the aggregate id, never a timestamp.
    *
    * For a REGISTERED topic this is not a free choice: `TopicSpec.keyedBy` is part of the contract,
-   * and `notify/src/catalogue.ts:124` and `activity/src/classify.ts` both read the envelope key AS
+   * and `notify/src/catalogue.ts` and `activity/src/classify.ts` both read the envelope key AS
    * the subject when the registry says a topic is keyed by `user_id`. `topics.ts` records what each
    * topic here is keyed by, and why.
    */

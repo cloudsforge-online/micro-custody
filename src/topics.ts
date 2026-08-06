@@ -5,11 +5,11 @@
  *
  * `@cloudsforge/contracts-events` registers **`custody.key.exported`** with producer `custody`,
  * `keyedBy: 'user_id'`, and the description "FIRST. A private key left the platform. The wallet is
- * self-custodied from here." Three consumers classify that name — `notify/src/catalogue.ts:334` at
- * `priority: 'critical'`, `activity/src/classify.ts:641`, `analytics/src/catalogue.ts:320` — the
- * audit mirror marks it `audited: true` (`contracts/packages/events/src/audit.ts:117`), and two
- * ecosystem documents name it as the event journey J5 ends on (`05-user-journeys.md:309`,
- * `07-dependency-map.md:173`).
+ * self-custodied from here." Three consumers classify that name — `notify/src/catalogue.ts` at
+ * `priority: 'critical'`, `activity/src/classify.ts`, `analytics/src/catalogue.ts` — the
+ * audit mirror marks it `audited: true` (`contracts/packages/events/src/audit.ts`), and two
+ * ecosystem documents name it as the event journey J5 ends on (`05-user-journeys.md`,
+ * `07-dependency-map.md`).
  *
  * **This service emitted `custody.export.completed` instead.** One name, in one repository, in no
  * registry, with no subscriber anywhere in the estate. So the redemption that transitions a wallet

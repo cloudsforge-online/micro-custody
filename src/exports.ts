@@ -271,7 +271,7 @@ export async function requestExport(deps: ExportDeps, input: RequestExportInput)
     emit({
       topic: 'custody.export.requested',
       // The USER, not the address. The registry says `keyedBy: 'user_id'` for this topic
-      // (contracts/packages/events/src/index.ts:372) and activity/src/classify.ts:634 reads the
+      // (contracts/packages/events/src/index.ts) and activity/src/classify.ts reads the
       // envelope key as the user id, so an address here filed every export request against a user
       // that does not exist. The address is still in the payload, where it belongs.
       key: input.userId,
@@ -457,7 +457,7 @@ export async function redeemExport(
      */
     emit({
       topic: 'custody.key.exported',
-      // Keyed by the user, per the registry (`keyedBy: 'user_id'`, index.ts:379). notify's
+      // Keyed by the user, per the registry (`keyedBy: 'user_id'`, index.ts). notify's
       // `userIdOf` and activity's `userFromKey` both read the key as the subject for this topic.
       key: row.user_id,
       payload: {

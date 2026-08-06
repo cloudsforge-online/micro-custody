@@ -16,7 +16,7 @@
  * comment used to say so while `routeSamples()` below was a hand-typed array that named eighteen of
  * the service's twenty-one routes; the three it missed included
  * `POST /v1/exports/:id/challenge`, which returns the reveal token — "the one secret in the estate
- * that yields a private key" (`exports.ts:394`). A hand-written list does not go red when somebody
+ * that yields a private key" (`exports.ts`). A hand-written list does not go red when somebody
  * adds a route; it just stops covering it, silently, which is exactly what happened. So:
  *
  *   * `server.routeTable()` is the enumeration, derived from `buildRoutes()` itself.
@@ -271,14 +271,14 @@ function forbidden(): string[] {
   })
   /*
    * THE SECOND TIER, and it is the same boundary micro-conformance's static estate-wide scan draws,
-   * sourced from `exports.ts:440-453`: the reveal token, because it is "the one secret in the estate
+   * sourced from `exports.ts`: the reveal token, because it is "the one secret in the estate
    * that yields a private key", and its SHA-256, because "the hash is what a redemption is compared
    * against". Both are forbidden EVERYWHERE, including on the route that mints the token — that
    * response has its single permitted copy subtracted by exact value before this list is applied,
    * which is a different thing from being exempt from it.
    *
    * Deliberately NOT here, for the same reason it is not there: `derivationPath`. Custody returns it
-   * on nine routes and `exports.ts:450` argues why — a path with no seed behind it opens nothing,
+   * on nine routes and `exports.ts` argues why — a path with no seed behind it opens nothing,
    * and a response goes to one authenticated user where an event goes to five stores.
    */
   if (scanRevealToken) parts.push(scanRevealToken, hashToken(scanRevealToken))
@@ -300,7 +300,7 @@ function assertClean(where: string, ...texts: string[]): void {
  * `Record<keyof T, true>` does not compile until every field is listed, so a field added to either
  * interface is a typecheck failure here before it is a red assertion — and the assertions below then
  * refuse any response whose key set is not exactly this. `ExportRecord` is documented as having "no
- * field that could carry key material" (`exports.ts:85`); this is that claim as something that
+ * field that could carry key material" (`exports.ts`); this is that claim as something that
  * breaks.
  */
 const EXPORT_RECORD_FIELDS = Object.keys({
@@ -547,7 +547,7 @@ function xrpSecret(): string {
  * what ELSE this route returns, because no test drove it at all.
  *
  * So this asserts the whole response rather than waving the route through: two top-level fields and
- * no third; a token of exactly the shape `exports.ts:349` mints (32 bytes, base64url); the ceremony
+ * no third; a token of exactly the shape `exports.ts` mints (32 bytes, base64url); the ceremony
  * projection beside it, field for field; and NOT the token's SHA-256, which is the stored form a
  * redemption is compared against and has no business on a wire. The token's single appearance in the
  * body is subtracted by exact value by the sweep, which then scans everything that is left.

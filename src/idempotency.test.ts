@@ -14,18 +14,18 @@
  * Two identities, because the two callers hand over two different things:
  *
  *   1. **the caller's own key**, `(created_by, idempotency-key)`. wallet sends one
- *      (`wallet/src/custodyclient.ts:266`) and so does mint (`mint/src/custodyclient.ts:203`).
+ *      (`wallet/src/custodyclient.ts`) and so does mint (`mint/src/custodyclient.ts`).
  *      Scoped by actor because the string is the caller's to choose and two services must not be
  *      able to collide by coincidence.
  *   2. **the binding**, `(chain, network, purpose, user_id, order_id)`, for `deposit` and
  *      `deployer` only. Those two purposes take their `orderId` from a row that is created once per
- *      ADDRESS — wallet's assignment id (`wallet/src/deposits.ts:196`) and mint's token id
- *      (`mint/src/deploy.ts:179`) — so a second row under one binding cannot be anything but a
+ *      ADDRESS — wallet's assignment id (`wallet/src/deposits.ts`) and mint's token id
+ *      (`mint/src/deploy.ts`) — so a second row under one binding cannot be anything but a
  *      duplicate. It catches the retry that carried no key, or a different one.
  *
  * And `treasury` is deliberately NOT in the second identity. Its binding is fixed per chain and
  * network by derivation (`keys.treasuryBinding`), so a rotation candidate is minted with the SAME
- * binding on purpose — `pickOutstandingCandidate` (`store.ts:350`) is that route's own reuse rule
+ * binding on purpose — `pickOutstandingCandidate` (`store.ts`) is that route's own reuse rule
  * and it has to be able to hand back a NEW address after a pin. Deduplicating on the binding there
  * would make a treasury rotation impossible, which is the "too loose" failure this file also pins.
  *
@@ -244,7 +244,7 @@ test('THE REPLAY: a repeat returns the ORIGINAL address and does not look like a
 test('THE REPLAY: it works with no idempotency key at all, because the binding is one too', { skip }, async () => {
   // The retry that lost its key, and the caller that never sent one. mint's client documents this
   // exact property — "Idempotent on (chain, network, userId, orderId)"
-  // (`mint/src/custodyclient.ts:124`) — and it was not true until migration 6.
+  // (`mint/src/custodyclient.ts`) — and it was not true until migration 6.
   const body = { ...DEPOSIT, orderId: 'assignment-1' }
   const first = await create(body)
   const second = await create(body)
@@ -258,7 +258,7 @@ test('THE REPLAY: it works with no idempotency key at all, because the binding i
 
 test('THE REPLAY: a rotation is NOT a retry — a fresh orderId mints a distinct address', { skip }, async () => {
   // The shape wallet actually sends on `rotate: true`: a new assignment id, and an idempotency key
-  // that names the assignment being replaced (`wallet/src/deposits.ts:222`). Both differ, so
+  // that names the assignment being replaced (`wallet/src/deposits.ts`). Both differ, so
   // neither identity matches, and the user gets the second address a rotation exists to give them.
   const first = await create({ ...DEPOSIT, orderId: 'assignment-1' }, 'wallet:deposit:alice:EMBER:testnet:first')
   const second = await create({ ...DEPOSIT, orderId: 'assignment-2' }, 'wallet:deposit:alice:EMBER:testnet:assignment-1')
@@ -270,7 +270,7 @@ test('THE REPLAY: a rotation is NOT a retry — a fresh orderId mints a distinct
 })
 
 test('a treasury rotation still mints, because its binding is shared by design', { skip }, async () => {
-  // `treasuryBinding` is derived from (chain, network) alone (`keys.ts:528`), so every rotation
+  // `treasuryBinding` is derived from (chain, network) alone (`keys.ts`), so every rotation
   // candidate for a chain carries the SAME binding. If `treasury` were inside the binding index the
   // first pin would be the last one this chain could ever have.
   const mint = () => server.request('/v1/admin/treasuries/ethereum/testnet/mint', { method: 'POST', token: 'operator' })
@@ -295,7 +295,7 @@ test('THE CONFLICT: one key over two bindings is refused, never answered with th
    * The dangerous direction, and the reason the key alone is not the identity.
    *
    * `orderId` is what settlement restates character for character to sweep the address — "a guessed
-   * binding is a sweep refused every tick for ever" (`settlement/src/server.ts:739`). Handing back
+   * binding is a sweep refused every tick for ever" (`settlement/src/server.ts`). Handing back
    * the FIRST request's address to a caller that named the SECOND request's orderId would file an
    * address under a binding custody never stored, and every sweep of it would be refused for ever.
    * A 409 costs the caller a retry. The alternative costs a user their deposit.
