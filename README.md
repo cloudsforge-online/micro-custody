@@ -198,6 +198,15 @@ Removing the old secret at step 3 loses every key still on it. The command's exi
 | GET | `/v1/admin/rotation` | `admin` role |
 | ~~POST~~ | ~~`/admin/keys/:address/reveal`~~ | **deleted — 404, asserted in the suite** |
 
+**`purpose: 'treasury'` is not the same claim as "the settlement treasury".** It means "an address
+the platform owns", and other services mint one for their own float under their own binding —
+`foresight`'s house seed and the `faucet`'s funding address both carry it. Only an address bound to
+`cloudsforge:treasury` / `treasury:<chain>:<network>` may be pinned or handed back as a rotation
+candidate (`treasuryBinding`, `src/store.ts`); anything else is refused
+`address_not_platform_treasury`. Selecting on purpose alone once returned foresight's house seed as
+the EMBER testnet treasury candidate, which would have swept every user deposit into it
+(micro-org#250).
+
 `GET /v1/addresses/:address` publishes neither `userId` nor `orderId`. Publishing them made the
 `/sign` binding check circular: everything a caller had to "prove" it knew was served, under the same
 credential, from a read.
