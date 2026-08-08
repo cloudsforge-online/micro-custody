@@ -19,6 +19,7 @@
  *      belongs where a bug, a migration or a psql prompt cannot route around it.
  */
 
+import type { KeyNetwork } from './chains.ts'
 import type { Db, Tx } from './outbox.ts'
 
 export type Purpose = 'deposit' | 'treasury' | 'deployer' | 'user'
@@ -392,7 +393,48 @@ export async function listTreasuryPins(sql: Db): Promise<TreasuryPinRecord[]> {
   return rows.map(toPinRecord)
 }
 
-export type PinRefusal = 'address_unknown' | 'address_not_treasury' | 'address_wrong_chain' | 'address_wrong_network' | 'address_not_active'
+/**
+ * The ONE binding a platform settlement treasury is minted under, DERIVED from (chain, network)
+ * rather than accepted from the caller.
+ *
+ * **It lives in this module rather than in `keys.ts` because it is now a filter as much as it is a
+ * mint input.** Both routes that decide which address becomes the treasury — the rotation-candidate
+ * query and the pin — have to apply it, both of them are in this file, and `keys.ts` imports this
+ * module, so the definition cannot go the other way round without a cycle.
+ *
+ * ── WHY `purpose = 'treasury'` IS NOT THE SAME QUESTION (micro-org#250) ───────────────────────
+ *
+ * `treasury` means "an address the platform owns", not "THE address deposits sweep into". Other
+ * services mint one for their own float under their own binding and are entitled to: on the live
+ * testnet stack `foresight-estate` holds the house seed and `faucet-estate` holds the faucet's
+ * funding address, both `purpose: 'treasury'`, both on `ember` `testnet`, and neither is the
+ * settlement treasury. Selecting on purpose alone handed foresight's house seed back as the
+ * rotation candidate for a chain with no pin at all, and would have pointed every user deposit at
+ * it. The faucet's address is the worse of the two: micro-settlement books the pinned address's
+ * balance as platform equity the moment it starts watching it, and the faucet then drips that float
+ * away — an unexplained NEGATIVE drift that freezes every withdrawal on the chain.
+ *
+ * The mint route is deliberately NOT narrowed to this binding: minting a platform-owned address is
+ * a capability other services legitimately have, and taking it away would break both of them. What
+ * is narrowed is which address may become the treasury.
+ */
+export function treasuryBinding(chain: string, network: KeyNetwork): { userId: string; orderId: string } {
+  return { userId: 'cloudsforge:treasury', orderId: `treasury:${chain}:${network}` }
+}
+
+/** True when this key was minted as the platform settlement treasury for its own chain and network. */
+function boundAsTreasury(row: Pick<CustodyKeyRow, 'chain' | 'network' | 'user_id' | 'order_id'>): boolean {
+  const binding = treasuryBinding(row.chain, row.network as KeyNetwork)
+  return row.user_id === binding.userId && row.order_id === binding.orderId
+}
+
+export type PinRefusal =
+  | 'address_unknown'
+  | 'address_not_treasury'
+  | 'address_wrong_chain'
+  | 'address_wrong_network'
+  | 'address_not_active'
+  | 'address_not_platform_treasury'
 
 export interface PinResult {
   readonly previous: TreasuryPinRecord | null
@@ -416,6 +458,11 @@ export async function pinTreasury(
   // An exported treasury is a treasury whose key somebody outside this service holds. Pinning one
   // would point every future sweep at an address the platform no longer solely controls.
   if (row.status !== 'active') return { refusal: 'address_not_active' }
+  // And it must be OUR treasury, not merely a treasury — see `treasuryBinding` above. This is the
+  // wall rather than the query below: the query decides what a repeat mint hands back, but an
+  // operator can name any address here, and `settlement`'s provision route forwards an operator's
+  // token verbatim.
+  if (!boundAsTreasury(row)) return { refusal: 'address_not_platform_treasury' }
 
   const existingRows = await sql<TreasuryRow[]>`
     select * from custody_treasuries where chain = ${input.chain} and network = ${input.network}
@@ -472,9 +519,14 @@ export async function outstandingTreasuryCandidate(
     select * from custody_treasuries where chain = ${chain} and network = ${network}
   `
   const pin = pinRows[0]
+  // Bound as well as purposed. Without the binding this returns another service's operating
+  // address for any (chain, network) the platform has not provisioned yet, and the mint route
+  // hands it back with `reused: true` instead of creating the treasury — micro-org#250.
+  const binding = treasuryBinding(chain, network as KeyNetwork)
   const rows = await sql<CustodyKeyRow[]>`
     select * from custody_keys
      where chain = ${chain} and network = ${network} and purpose = 'treasury' and status = 'active'
+       and user_id = ${binding.userId} and order_id = ${binding.orderId}
   `
   return pickOutstandingCandidate(rows, pin ? { address: pin.address, setAt: pin.set_at } : null)
 }

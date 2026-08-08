@@ -14,7 +14,7 @@ import type postgres from 'postgres'
 import { versionOf } from './crypto.ts'
 import { provisionAddress, signForAddress } from './keys.ts'
 import { reencryptOnce, remainingCount } from './reencrypt.ts'
-import { pinTreasury } from './store.ts'
+import { pinTreasury, treasuryBinding } from './store.ts'
 import { MemoryVault } from './vault.ts'
 import {
   ALICE,
@@ -50,13 +50,16 @@ beforeEach(async () => {
 })
 
 async function mint(h: Harness, orderId: string, purpose: 'deposit' | 'treasury' = 'deposit') {
+  // A treasury takes the DERIVED binding, not a caller's: since micro-org#250 an address bound to
+  // anyone else is refused a pin, and the pin below is what this test needs the treasury for.
+  const binding = treasuryBinding('ethereum', 'testnet')
   const result = await provisionAddress(h.keys, {
     chain: 'ethereum',
     network: 'testnet',
     purpose,
-    userId: ALICE,
-    orderId,
-    ...(purpose === 'treasury' ? { scheme: 'flat_random' as const } : {}),
+    ...(purpose === 'treasury'
+      ? { userId: binding.userId, orderId: binding.orderId, scheme: 'flat_random' as const }
+      : { userId: ALICE, orderId }),
     createdBy: 'service:wallet',
     correlationId: 'c',
   })

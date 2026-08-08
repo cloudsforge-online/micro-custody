@@ -694,6 +694,75 @@ test('a rotation names the superseded address so its balance is not silently str
   assert.deepEqual({ ...rows[0] }, { purpose: 'treasury', status: 'active' })
 })
 
+/* ------------------------------------ micro-org#250: purpose 'treasury' is not "the treasury" */
+
+/**
+ * Another service's platform-owned address, minted the way `foresight` and the `faucet` actually
+ * mint theirs on the live estate: `purpose: 'treasury'`, its own binding, the ordinary address
+ * route. It is a legitimate address and the mint below must keep succeeding — what it must never
+ * become is the address deposits sweep into.
+ */
+async function mintForeignTreasury(userId = ALICE, orderId = 'foresight-house-seed') {
+  const response = await mint({ chain: 'ethereum', network: 'testnet', purpose: 'treasury', userId, orderId })
+  assert.equal(response.status, 201, response.text)
+  return (response.body.key as Record<string, unknown>).address as string
+}
+
+test('another service\'s treasury-purpose address is NOT handed back as the rotation candidate', { skip }, async () => {
+  // The measured failure: on the live testnet stack the only two `purpose: 'treasury'` keys on
+  // ember/testnet belonged to foresight and the faucet, nothing was pinned, and the mint route
+  // answered 200 `reused: true` with foresight's house seed. Every user deposit would have swept
+  // into it.
+  const foreign = await mintForeignTreasury()
+  const minted = await server.request('/v1/admin/treasuries/ethereum/testnet/mint', { method: 'POST', token: 'operator' })
+  assert.equal(minted.status, 201, 'the platform treasury is CREATED, not reused from a stranger')
+  assert.equal(minted.body.reused, false)
+  const address = (minted.body.key as Record<string, unknown>).address as string
+  assert.notEqual(address, foreign)
+  // And it carries the derived binding, which is the thing that made it selectable.
+  const rows = await sql<{ user_id: string; order_id: string }[]>`
+    select user_id, order_id from custody_keys where address = ${address}
+  `
+  assert.deepEqual({ ...rows[0] }, { user_id: 'cloudsforge:treasury', order_id: 'treasury:ethereum:testnet' })
+})
+
+test('another service\'s treasury-purpose address cannot be pinned, whoever asks', { skip }, async () => {
+  // The query above decides what a REPEAT MINT hands back. This is the wall: an operator can name
+  // any address here, and settlement's provision route forwards an operator's token verbatim.
+  const foreign = await mintForeignTreasury()
+  const pinned = await server.request('/v1/admin/treasuries/ethereum/testnet', {
+    method: 'PUT',
+    token: 'operator',
+    body: { address: foreign },
+  })
+  assert.equal(pinned.status, 400)
+  assert.equal(errorOf(pinned).code, 'address_not_platform_treasury')
+  const pins = await server.request('/v1/admin/treasuries', { token: 'operator' })
+  assert.deepEqual(pins.body.treasuries, [])
+})
+
+test('a rotation candidate is still reused, and a rotation still rotates, with a stranger present', { skip }, async () => {
+  // The binding filter must not narrow the set so far that a treasury has nowhere to rotate to —
+  // the failure `keys.ts` warns about at BINDING_NAMES_ONE_ADDRESS. Both properties, with a
+  // foreign treasury-purpose address sitting in the same (chain, network) throughout.
+  await mintForeignTreasury(BOB, 'faucet-funding')
+  const first = await mintAndPinTreasury()
+  const candidate = await server.request('/v1/admin/treasuries/ethereum/testnet/mint', { method: 'POST', token: 'operator' })
+  assert.equal(candidate.status, 201)
+  const second = (candidate.body.key as Record<string, unknown>).address as string
+  assert.notEqual(second, first, 'a pinned treasury must have somewhere to rotate TO')
+  const again = await server.request('/v1/admin/treasuries/ethereum/testnet/mint', { method: 'POST', token: 'operator' })
+  assert.equal(again.body.reused, true)
+  assert.equal((again.body.key as Record<string, unknown>).address, second)
+  const rotated = await server.request('/v1/admin/treasuries/ethereum/testnet', {
+    method: 'PUT',
+    token: 'operator',
+    body: { address: second },
+  })
+  assert.equal(rotated.status, 200, rotated.text)
+  assert.equal(rotated.body.supersededAddress, first)
+})
+
 test('there is no write route for the pin on the signing surface', { skip }, async () => {
   // If a signing credential could write the pin, the sweep shape would be a total-loss
   // vulnerability rather than a containment.

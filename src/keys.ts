@@ -106,9 +106,10 @@ export type ProvisionResult =
  * id (`mint/src/deploy.ts`). A second key under one of those bindings is a duplicate mint by
  * definition, and a rotation is safe because a rotation is a new assignment with a new id.
  *
- * `treasury` is excluded and its exclusion is the load-bearing half: `treasuryBinding` derives the
- * binding from (chain, network) alone, so a rotation candidate is minted under the SAME binding on
- * purpose. Deduplicating it would leave a pinned treasury with nowhere to rotate to.
+ * `treasury` is excluded and its exclusion is the load-bearing half: `treasuryBinding`
+ * (`store.ts`) derives the binding from (chain, network) alone, so a rotation candidate is minted
+ * under the SAME binding on purpose. Deduplicating it would leave a pinned treasury with nowhere to
+ * rotate to.
  */
 const BINDING_NAMES_ONE_ADDRESS: ReadonlySet<Purpose> = new Set<Purpose>(['deposit', 'deployer'])
 
@@ -749,11 +750,6 @@ async function auditOnly(
       correlationId: input.correlationId,
     })
   })
-}
-
-/** A treasury mint's binding, DERIVED rather than accepted from the caller. */
-export function treasuryBinding(chain: string, network: KeyNetwork): { userId: string; orderId: string } {
-  return { userId: 'cloudsforge:treasury', orderId: `treasury:${chain}:${network}` }
 }
 
 /** A correlation id when the caller supplied none. */
