@@ -41,7 +41,7 @@ import type { Lifecycle } from '@cloudsforge/lifecycle'
 import { Metrics, newRequestId, type Logger } from '@cloudsforge/telemetry'
 import { familyForChain, isKnownChain, type KeyNetwork } from './chains.ts'
 import { signScopeFor } from './gates.ts'
-import { provisionAddress, signForAddress, treasuryBinding, type KeyDeps } from './keys.ts'
+import { provisionAddress, signForAddress, type KeyDeps } from './keys.ts'
 import {
   EXPORT_FORMATS,
   cancelExport,
@@ -69,6 +69,7 @@ import {
   signAttemptsSince,
   toKeyAdminRecord,
   toKeyRecord,
+  treasuryBinding,
   type PinRefusal,
   type Purpose,
   type Scheme,
@@ -850,6 +851,10 @@ const PIN_REFUSAL_REASON: Record<PinRefusal, string> = {
   address_wrong_chain: 'that address belongs to a different chain',
   address_wrong_network: 'that address belongs to a different network',
   address_not_active: 'that address has been exported or retired and may not be pinned',
+  address_not_platform_treasury:
+    "that address is purpose 'treasury' but is not bound to this chain's platform treasury — it " +
+    'belongs to another service and pinning it would sweep every deposit into that service\'s ' +
+    'float. Mint the platform treasury with POST /v1/admin/treasuries/:chain/:network/mint.',
 }
 
 /* ------------------------------------------------------------------ helpers */
