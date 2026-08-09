@@ -435,6 +435,30 @@ export function treasuryBinding(chain: string, network: KeyNetwork): { userId: s
   return { userId: 'cloudsforge:treasury', orderId: `treasury:${chain}:${network}` }
 }
 
+/**
+ * The same derivation for the MINING POOL'S PAYOUT ADDRESS, and a SIBLING of the function above
+ * rather than a call into it.
+ *
+ * A sibling because the two strings must not collide. `treasuryBinding` is not merely an
+ * identifier here: `boundAsTreasury` compares against it and `pinTreasury` refuses anything that
+ * does not match, so a pool payout address carrying the treasury's binding would be one purpose
+ * check away from being pinnable — and migration 8's whole argument is that a pool address must
+ * never reach `custody_treasuries`. Deriving one from the other, or sharing a prefix, is how those
+ * two strings drift into each other in a later edit. They are written out separately so they
+ * cannot.
+ *
+ * Derived from (chain, network) and not accepted from the caller, for the reason the treasury's is:
+ * the route that mints it is the only thing that should decide what a pool payout address is bound
+ * to, and a binding an operator types is a binding an operator can typo into a second address.
+ *
+ * The strings match what the estate already mints by hand through `POST /v1/addresses` —
+ * `cloudsforge:pool` and `pool:<chain>:<network>` — so this route adopts the addresses that already
+ * exist under it rather than minting a second one beside them.
+ */
+export function poolPayoutBinding(chain: string, network: KeyNetwork): { userId: string; orderId: string } {
+  return { userId: 'cloudsforge:pool', orderId: `pool:${chain}:${network}` }
+}
+
 /** True when this key was minted as the platform settlement treasury for its own chain and network. */
 function boundAsTreasury(row: Pick<CustodyKeyRow, 'chain' | 'network' | 'user_id' | 'order_id'>): boolean {
   const binding = treasuryBinding(row.chain, row.network as KeyNetwork)
@@ -542,6 +566,48 @@ export async function outstandingTreasuryCandidate(
        and user_id = ${binding.userId} and order_id = ${binding.orderId}
   `
   return pickOutstandingCandidate(rows, pin ? { address: pin.address, setAt: pin.set_at } : null)
+}
+
+/**
+ * The pool payout address a repeat mint must hand back instead of making another. Null when there
+ * is none.
+ *
+ * ── WHY THIS IS A QUERY AND NOT A UNIQUE INDEX ────────────────────────────────────────────────
+ *
+ * Migration 8 considered `unique (chain, network) where purpose = 'pool'` and refused it, in
+ * writing, for a reason that is about money rather than about schema taste: a pool payout key
+ * ACCUMULATES — every block the pool ever finds adds to it — so it is precisely the key an operator
+ * must be able to abandon and replace, on a suspected compromise or a change of pool operator.
+ * Under that index the replacement mint fails with a 23505 that no operator can act on, and the only
+ * moves left are mutating or deleting the live row. So the idempotency the mint route needs has to
+ * live here, in code, where it can be narrower than "one for ever".
+ *
+ * ── AND THE `status` FILTER IS WHAT KEEPS ROTATION REACHABLE ──────────────────────────────────
+ *
+ * `active` only, and that is the whole escape hatch. While the payout key is live this hands the
+ * same address back for ever, which is the safe answer — a second operator running the same runbook
+ * step must not walk away with a different address from the one already named in
+ * `POOL_<CHAIN>_PAYOUT_ADDRESS`. The day the key must be replaced, retiring the row it selects makes
+ * the next call a 201 rather than a refusal, and the abandoned row stays in `custody_keys` still
+ * saying who holds the coin sitting at it. That is the difference between a rule and a constraint,
+ * and it is the reason migration 8 left the constraint out.
+ *
+ * NOT pin-aware, unlike `outstandingTreasuryCandidate`, because there is no pin: custody has exactly
+ * one table that says "this address is the live one for this chain" and the entire point of
+ * migration 8 is that a `pool` row must never appear in it. Which pool address is live is a fact
+ * micro-pool's configuration holds, not this service.
+ */
+export async function outstandingPoolPayout(sql: Db, chain: string, network: string): Promise<CustodyKeyRow | null> {
+  const binding = poolPayoutBinding(chain, network as KeyNetwork)
+  const rows = await sql<CustodyKeyRow[]>`
+    select * from custody_keys
+     where chain = ${chain} and network = ${network} and purpose = 'pool' and status = 'active'
+       and user_id = ${binding.userId} and order_id = ${binding.orderId}
+     order by created_at desc
+  `
+  // Newest first. Two can only exist if a mint raced itself — nothing else writes this binding —
+  // and the caller of a race wants the address its own request would have produced.
+  return rows[0] ?? null
 }
 
 /* ------------------------------------------------------------------ signing audit */

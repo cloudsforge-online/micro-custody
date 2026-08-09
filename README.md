@@ -195,6 +195,7 @@ Removing the old secret at step 3 loses every key still on it. The command's exi
 | POST | `/v1/exports/:id/{cancel,challenge,redeem}` | the owner |
 | GET | `/v1/admin/keys`, `/v1/admin/keys/:address`, `…/audit` | `admin` role |
 | GET/POST/PUT | `/v1/admin/treasuries…` | `admin` role |
+| POST | `/v1/admin/pool-payouts/:chain/:network/mint` | `admin` role — **not** `custody:address:create` |
 | GET | `/v1/admin/rotation` | `admin` role |
 | ~~POST~~ | ~~`/admin/keys/:address/reveal`~~ | **deleted — 404, asserted in the suite** |
 
@@ -213,9 +214,21 @@ miners' claim on it" (36 §5.3) — is a key custody holds rather than one on th
 purpose of its own rather than `treasury` because a `treasury` row on a chain the pool mines is a
 rotation candidate for the settlement pin, and a pinned pool address would turn every block ever
 mined to it into unbooked custody inflow. It is not in `SIGNABLE_PURPOSES`: a miner payout names
-destinations custody cannot choose, and 36 §5.3 pays miners by crediting the ledger. Nothing pins
-it, nothing dedupes it — a payout key accumulates block rewards and has to stay re-mintable for a
-rotation. Migration 8 carries the argument in full.
+destinations custody cannot choose, and 36 §5.3 pays miners by crediting the ledger. Migration 8
+carries the argument in full.
+
+An operator mints one with `POST /v1/admin/pool-payouts/:chain/:network/mint` (micro-org#293). It
+needs its own route because `POST /v1/addresses` is gated on `custody:address:create`, `hasScope`
+refuses every non-service principal, and micro-pool holds no grant because it never calls custody —
+so without this route the address every block reward pays into is minted on wallet's credential and
+`created_by` names wallet for ever. The route mints `flat_random` under a binding derived from the
+path, does **not** pin and does **not** tell micro-pool: naming the address in
+`POOL_<CHAIN>_PAYOUT_ADDRESS` stays the operator's deliberate second step, and until it does the
+address is inert. A repeat call returns the same address with `reused: true` and status 200 rather
+than a second one — that idempotency is the route's, not the schema's, because migration 8 refused
+`unique (chain, network) where purpose = 'pool'` on the grounds that a payout key accumulates block
+rewards and must stay replaceable. Replacing one stays as deliberate and as stepwise as a treasury
+rotation: retire the live row, mint, move the balance, then repoint the variable.
 
 `GET /v1/addresses/:address` publishes neither `userId` nor `orderId`. Publishing them made the
 `/sign` binding check circular: everything a caller had to "prove" it knew was served, under the same
