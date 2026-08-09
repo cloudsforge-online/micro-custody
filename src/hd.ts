@@ -26,13 +26,19 @@ import { wordlist } from '@scure/bip39/wordlists/english'
 import { createHmac } from 'node:crypto'
 import { ethers } from 'ethers'
 import { Keypair } from '@solana/web3.js'
-import * as bitcoin from 'bitcoinjs-lib'
 // xrpl is CommonJS and defines ECDSA with an Object.defineProperty getter, which the CJS module
 // lexer in Node 22 cannot see — `import { ECDSA }` throws at import time there (Node 24's lexer
 // finds it, which is why this only failed in CI). The default import is the module.exports object
 // itself under Node's CJS interop in every version, so the getter is reached at property access.
 import xrpl, { Wallet as XrplWallet } from 'xrpl'
-import { ECPair, bitcoinNetwork, type GeneratedKey, type KeyFamily, type KeyNetwork } from './chains.ts'
+import {
+  ECPair,
+  bitcoinNetwork,
+  bitcoinPayment,
+  type GeneratedKey,
+  type KeyFamily,
+  type KeyNetwork,
+} from './chains.ts'
 
 /** 256 bits of entropy, so 24 words. A 12-word phrase is fine and this is a custody service. */
 const ENTROPY_BITS = 256
@@ -64,11 +70,33 @@ const COIN_TYPE: Readonly<Record<KeyFamily, number>> = Object.freeze({
  * restore rather than at derivation, which makes it the worse half of the bug: the address works,
  * the deposit arrives, the sweep signs, and only a user recovering from their phrase finds out.
  *
- * Keyed by CHAIN NAME and consulted before the family, so adding a bitcoin-family chain without
- * its own coin type is a decision somebody has to make rather than a default they inherit.
+ * Keyed by CHAIN NAME and consulted before the family, so adding a chain without its own coin type
+ * is a decision somebody has to make rather than a default they inherit. It is not a bitcoin-family
+ * table: `ethereum-classic` is here for exactly the same reason Litecoin is, one family over.
+ *
+ * Every number below was read on 2026-08-09 from the SLIP-0044 registry (`satoshilabs/slips`,
+ * `slip-0044.md`): LTC 2, DOGE 3, ETC 61, against BTC 0 and ETH 60. The ETC value is corroborated by
+ * `ethereum-lists/chains`, whose `eip155-61.json` carries `"slip44": 61` — and whose Mordor testnet
+ * entry `eip155-63.json` carries `"slip44": 1`, which is the same testnet rule `coinTypeFor` already
+ * applies to every chain, so no testnet special case is needed for ETC.
  */
 const CHAIN_COIN_TYPE: Readonly<Record<string, number>> = Object.freeze({
   litecoin: 2,
+  /**
+   * DOGE is 3. Its family is `'bitcoin'` (0), so without this line a Dogecoin key derives on
+   * Bitcoin's path and the restore failure described above happens again, one chain later.
+   */
+  dogecoin: 3,
+  /**
+   * ETC is 61 — a coin type, not its chain id, which coincidentally has the same value. The two are
+   * separate registries and this entry is the SLIP-0044 one; ETC's EIP-155 chain id reaches custody
+   * through `chainSpec()` and never through this table.
+   *
+   * The family is `'evm'`, which is 60, so this override is what stops a user's ETC key and their
+   * ETH key being the same key. They would otherwise be: same seed, same path, same address — and a
+   * phrase exported from here would restore ETC funds to a wallet showing them under Ethereum.
+   */
+  'ethereum-classic': 61,
 })
 
 const TESTNET_COIN_TYPE = 1
@@ -225,8 +253,10 @@ export function deriveKey(
     case 'bitcoin': {
       const net = bitcoinNetwork(chain, network)
       const keyPair = ECPair.fromPrivateKey(privBuf, { network: net })
-      const { address } = bitcoin.payments.p2wpkh({ pubkey: Buffer.from(keyPair.publicKey), network: net })
-      return { address: address!, privateKey: keyPair.toWIF(), derivationPath: path }
+      // The address KIND is the chain's too, not just the network parameters: Dogecoin has no
+      // segwit, so a `p2wpkh` call here would have produced an address on no chain at all.
+      const { address } = bitcoinPayment(Buffer.from(keyPair.publicKey), chain, network)
+      return { address, privateKey: keyPair.toWIF(), derivationPath: path }
     }
     case 'xrp': {
       // XRP's secret is a base58 FAMILY SEED carrying 16 bytes of entropy, not a 32-byte private

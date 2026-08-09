@@ -8,7 +8,14 @@
 import { createHash, randomUUID } from 'node:crypto'
 import type { Logger } from '@cloudsforge/telemetry'
 import type { Keyring } from './crypto.ts'
-import { familyForChain, generateFlatRandom, isEvmFamily, type KeyFamily, type KeyNetwork } from './chains.ts'
+import {
+  familyForChain,
+  generateFlatRandom,
+  isEvmFamily,
+  isLegacyGasOnlyChain,
+  type KeyFamily,
+  type KeyNetwork,
+} from './chains.ts'
 import { deriveKey, newMnemonic, seedFromMnemonic } from './hd.ts'
 import {
   bindingMatches,
@@ -660,6 +667,11 @@ async function produceSignature(
     case 'evm':
     case 'ember': {
       const shape = evmShapeForPurpose(row.purpose)
+      // `row.chain` and NOT `row.family`, which is what this read until ETC arrived. Ethereum
+      // Classic's family is `'evm'` — the same value Ethereum carries — and it is pre-London, so a
+      // family test says "EIP-1559 is fine" for a chain on which a type-2 transaction is not valid
+      // at all. `isLegacyGasOnlyChain` is where the list and the evidence for it live.
+      const legacyOnly = isLegacyGasOnlyChain(row.chain)
       // Built as a union member rather than one object with an optional pin, so a 'sweep' with no
       // pin does not compile. `treasuryPin` is non-empty here because 'sweep' is reachable only from
       // purpose 'deposit', which is the branch that resolved it — and `signing.ts` refuses an empty
@@ -671,9 +683,9 @@ async function produceSignature(
               shape,
               treasuryPin: ctx.treasuryPin,
               tokenAllowlist: ctx.tokenAllowlist,
-              legacyOnly: row.family === 'ember',
+              legacyOnly,
             }
-          : { chainId: ctx.chainId, shape, legacyOnly: row.family === 'ember' }
+          : { chainId: ctx.chainId, shape, legacyOnly }
       return signEvm(privateKey, payload, policy)
     }
     case 'solana': {

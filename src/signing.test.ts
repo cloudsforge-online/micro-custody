@@ -677,15 +677,16 @@ test('SD-09 §4 — a BTC sweep may not burn the deposit as FEE, even paying onl
     witnessUtxo: { script: btcPayment.output!, value: 10_000_000 },
     sighashType: bitcoin.Transaction.SIGHASH_ALL,
   })
-  // A 110-vByte transaction, so this leaves ~2727 sat/vB as fee: over the sweep ceiling of 1000 and
-  // under the 5000 a payment is still allowed.
+  // A 110-vByte transaction, so this leaves ~2727 sat/vB as fee: over Bitcoin's sweep ceiling of
+  // 1000 and under the 5000 a payment is still allowed. The ceilings are per-chain now (Dogecoin's
+  // ordinary fee rate is itself 1000), so these two numbers are Bitcoin's rather than the service's.
   p.addOutput({ script: btcTreasury.output!, value: 9_700_000 })
   const greedy = p.toBase64()
 
   assert.throws(
     () => signBitcoin(btcKey.toWIF(), greedy, btcPayment.address!, 'testnet', BTC_SWEEP, 'bitcoin'),
     (err: unknown) =>
-      err instanceof SignRefused && /pays 2727 sat\/vB in fee, above the 1000/.test((err as Error).message),
+      err instanceof SignRefused && /pays 2727 per vB in fee, above the 1000/.test((err as Error).message),
   )
   // And it is a REFUSAL, not the bare Error bitcoinjs throws — a 500 writes no audit row, and the
   // rate limiter counts audit rows, so an unaudited path is one a caller can probe without limit.
@@ -1117,4 +1118,313 @@ test('LITECOIN: a Bitcoin treasury pinned against a Litecoin row is refused, not
       ),
     (err: unknown) => err instanceof SignRefused && /no usable treasury is pinned/.test((err as Error).message),
   )
+})
+
+/* ══════════════════════════════════════════════════════════════════════════════════════════════
+ * DOGECOIN SIGNING — the same shape as Litecoin's block above, plus the part Litecoin never had:
+ * A DOGECOIN INPUT IS NOT A WITNESS INPUT.
+ *
+ * Dogecoin has no segwit, so its inputs are P2PKH and a P2PKH signature does not commit to the
+ * input's value. There is therefore no `witnessUtxo` to read a value out of, and the whole previous
+ * transaction has to be supplied and checked instead. Two things follow, and both are asserted:
+ *
+ *   1. the signer must ACCEPT `nonWitnessUtxo` for this chain, or every DOGE sweep is refused and
+ *      the deposits are unspendable;
+ *   2. it must REFUSE it for a segwit chain, and refuse a witness-only input for this one, rather
+ *      than falling through to bitcoinjs's `No inputs were signed` — a bare Error, which reaches the
+ *      route as a 500 with no audit row and therefore no rate limiting.
+ *
+ * The fee ceiling gets its own test for a reason given at `FEE_RATE_CEILINGS`: Dogecoin Core's
+ * recommended fee rate is 1000 koinu/vB, which was Bitcoin's sweep CEILING, so a shared constant
+ * refused every ordinary Dogecoin sweep forever.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+
+const dogeNetwork = bitcoinNetwork('dogecoin', 'testnet')
+const dogeKey = ECPair.makeRandom({ network: dogeNetwork })
+const dogePayment = bitcoin.payments.p2pkh({ pubkey: Buffer.from(dogeKey.publicKey), network: dogeNetwork })
+const dogeTreasuryKey = ECPair.makeRandom({ network: dogeNetwork })
+const dogeTreasury = bitcoin.payments.p2pkh({
+  pubkey: Buffer.from(dogeTreasuryKey.publicKey),
+  network: dogeNetwork,
+})
+
+/**
+ * A previous transaction paying `script`, so a legacy input has something real to point at.
+ *
+ * Built rather than faked because the signer checks that the supplied transaction IS the one the
+ * outpoint names — `Buffer.alloc(32, 9)` as a hash, which is all the segwit fixtures above need,
+ * cannot work here.
+ */
+function dogePrevTx(script: Buffer, value: number): bitcoin.Transaction {
+  const tx = new bitcoin.Transaction()
+  tx.version = 1
+  tx.addInput(Buffer.alloc(32, 3), 0)
+  tx.addOutput(script, value)
+  return tx
+}
+
+interface DogePsbtOptions {
+  readonly outputs: readonly Buffer[]
+  readonly inValue?: number
+  readonly outValue?: number
+  /** Pay the prevout to somebody else, to exercise the ownership check. */
+  readonly prevScript?: Buffer
+  /** Supply a witnessUtxo instead of the previous transaction, as a segwit caller would. */
+  readonly asWitness?: boolean
+  /** Supply a previous transaction that is not the one the outpoint names. */
+  readonly wrongPrevTx?: boolean
+}
+
+function dogePsbt(options: DogePsbtOptions): string {
+  const inValue = options.inValue ?? 100_000
+  const outValue = options.outValue ?? 90_000
+  const script = options.prevScript ?? dogePayment.output!
+  const prev = dogePrevTx(script, inValue)
+  const p = new bitcoin.Psbt({ network: dogeNetwork })
+  p.addInput({
+    hash: prev.getHash(),
+    index: 0,
+    ...(options.asWitness
+      ? { witnessUtxo: { script, value: inValue } }
+      : { nonWitnessUtxo: (options.wrongPrevTx ? dogePrevTx(script, inValue + 1) : prev).toBuffer() }),
+  })
+  for (const s of options.outputs) p.addOutput({ script: s, value: Math.floor(outValue / options.outputs.length) })
+  return p.toBase64()
+}
+
+test('DOGECOIN: a sweep of a Dogecoin deposit address signs, and the result has no witness', () => {
+  const signed = signBitcoin(
+    dogeKey.toWIF(),
+    dogePsbt({ outputs: [dogeTreasury.output!] }),
+    dogePayment.address!,
+    'testnet',
+    { shape: 'sweep', treasuryPin: dogeTreasury.address! },
+    'dogecoin',
+  )
+  const tx = bitcoin.Transaction.fromHex(signed)
+  assert.equal(tx.ins.length, 1)
+  // THE STRUCTURAL ASSERTION. A segwit-signed input carries its signature in the witness and leaves
+  // the scriptSig empty; a legacy one is the other way round. Getting this backwards on Dogecoin
+  // produces a transaction no node will relay, so it is checked rather than assumed from "it signed".
+  assert.equal(tx.ins[0]!.witness.length, 0, 'a Dogecoin input must carry no witness')
+  assert.ok(tx.ins[0]!.script.length > 0, 'a Dogecoin input must carry a scriptSig')
+  assert.equal(tx.hasWitnesses(), false)
+})
+
+test("DOGECOIN: a sweep at Core's own recommended fee rate is SIGNED, not refused", () => {
+  /*
+   * **THE REGRESSION THE PER-CHAIN CEILING EXISTS FOR.** `dogecoin/dogecoin` `src/policy/policy.h`
+   * sets `RECOMMENDED_MIN_TX_FEE = COIN / 100` — 0.01 DOGE per kB, i.e. 1000 koinu/vB, which is
+   * exactly Bitcoin's sweep ceiling. Under one shared constant this PSBT is refused, and so is every
+   * ordinary Dogecoin sweep after it: the rate is set by policy rather than by a market, so unlike a
+   * Bitcoin fee spike it never falls and the deposits are simply never swept.
+   *
+   * The fee is asserted from the SIGNED transaction rather than trusted to be what was intended,
+   * because a test that merely signs would still pass if the sizes were nothing like a real sweep.
+   */
+  const signed = signBitcoin(
+    dogeKey.toWIF(),
+    dogePsbt({ outputs: [dogeTreasury.output!], inValue: 1_000_000, outValue: 808_000 }),
+    dogePayment.address!,
+    'testnet',
+    { shape: 'sweep', treasuryPin: dogeTreasury.address! },
+    'dogecoin',
+  )
+  const tx = bitcoin.Transaction.fromHex(signed)
+  const rate = (1_000_000 - 808_000) / tx.virtualSize()
+  assert.ok(rate >= 1_000, `expected at least Core's recommended 1000 koinu/vB, got ${rate}`)
+  assert.ok(rate < 10_000, `the fixture must stay under the sweep ceiling, got ${rate}`)
+})
+
+test('DOGECOIN: a sweep that burns the deposit as fee is still refused, at the chain own ceiling', () => {
+  // The ceiling moved for Dogecoin; it did not go away. The pin bounds where a sweep may pay and
+  // this bounds how much, and it is the holder of `custody:sign:deposit` both exist to contain.
+  const greedy = dogePsbt({ outputs: [dogeTreasury.output!], inValue: 10_000_000, outValue: 1_000_000 })
+  assert.throws(
+    () =>
+      signBitcoin(dogeKey.toWIF(), greedy, dogePayment.address!, 'testnet', { shape: 'sweep', treasuryPin: dogeTreasury.address! }, 'dogecoin'),
+    (err: unknown) => err instanceof SignRefused && /in fee, above the 10000/.test((err as Error).message),
+  )
+  // And the same bytes under the payment shape are signed, because a treasury's residual is SDR-05.
+  assert.match(
+    signBitcoin(dogeKey.toWIF(), greedy, dogePayment.address!, 'testnet', { shape: 'payment' }, 'dogecoin'),
+    /^[0-9a-f]+$/,
+  )
+})
+
+test('DOGECOIN: a legacy input with only a witnessUtxo is REFUSED, not left unsigned', () => {
+  /*
+   * Measured 2026-08-09 against the pinned `bitcoinjs-lib`: this case does not fail loudly on its
+   * own. `signAllInputs` skips the input and then throws `No inputs were signed` — a bare Error with
+   * no indication of which input or why, reaching the route as a 500 that writes no audit row. The
+   * rate limiter counts audit rows, so an unaudited path is one a caller can probe in a loop.
+   */
+  assert.throws(
+    () =>
+      signBitcoin(
+        dogeKey.toWIF(),
+        dogePsbt({ outputs: [dogeTreasury.output!], asWitness: true }),
+        dogePayment.address!,
+        'testnet',
+        { shape: 'sweep', treasuryPin: dogeTreasury.address! },
+        'dogecoin',
+      ),
+    (err: unknown) => err instanceof SignRefused && /has no nonWitnessUtxo/.test((err as Error).message),
+  )
+})
+
+test('DOGECOIN: a nonWitnessUtxo that is not the transaction being spent is refused', () => {
+  /*
+   * WITHOUT THIS THE OWNERSHIP CHECK MEANS NOTHING. The prevout script is read out of the supplied
+   * transaction, so a caller who may supply an unrelated transaction chooses which script the vault
+   * address is compared against. bitcoinjs does check the hash — but inside `signAllInputs`, long
+   * after the ownership check has already been satisfied by the wrong bytes.
+   */
+  assert.throws(
+    () =>
+      signBitcoin(
+        dogeKey.toWIF(),
+        dogePsbt({ outputs: [dogeTreasury.output!], wrongPrevTx: true }),
+        dogePayment.address!,
+        'testnet',
+        { shape: 'sweep', treasuryPin: dogeTreasury.address! },
+        'dogecoin',
+      ),
+    (err: unknown) => err instanceof SignRefused && /not the transaction it spends/.test((err as Error).message),
+  )
+})
+
+test('DOGECOIN: a foreign input is refused, exactly as on the segwit chains', () => {
+  const foreign = bitcoin.payments.p2pkh({
+    pubkey: Buffer.from(ECPair.makeRandom({ network: dogeNetwork }).publicKey),
+    network: dogeNetwork,
+  })
+  assert.throws(
+    () =>
+      signBitcoin(
+        dogeKey.toWIF(),
+        dogePsbt({ outputs: [dogeTreasury.output!], prevScript: foreign.output! }),
+        dogePayment.address!,
+        'testnet',
+        { shape: 'sweep', treasuryPin: dogeTreasury.address! },
+        'dogecoin',
+      ),
+    (err: unknown) => err instanceof SignRefused && /does not spend this vault address/.test((err as Error).message),
+  )
+})
+
+test('DOGECOIN: the pin is still the vault choice — a foreign output is refused', () => {
+  const foreign = bitcoin.payments.p2pkh({
+    pubkey: Buffer.from(ECPair.makeRandom({ network: dogeNetwork }).publicKey),
+    network: dogeNetwork,
+  })
+  assert.throws(
+    () =>
+      signBitcoin(
+        dogeKey.toWIF(),
+        dogePsbt({ outputs: [foreign.output!] }),
+        dogePayment.address!,
+        'testnet',
+        { shape: 'sweep', treasuryPin: dogeTreasury.address! },
+        'dogecoin',
+      ),
+    (err: unknown) => err instanceof SignRefused && /does not pay the treasury/.test((err as Error).message),
+  )
+})
+
+test('DOGECOIN: a Dogecoin key presented as a Bitcoin one refuses, and the reverse too', () => {
+  // The mutation this exists for is the same as Litecoin's — hard-coding `'bitcoin'` at the call
+  // site — and it is a throw rather than a refusal because a WIF that will not import is a fault in
+  // this service's wiring, not a caller's malformed request.
+  assert.throws(() =>
+    signBitcoin(
+      dogeKey.toWIF(),
+      dogePsbt({ outputs: [dogeTreasury.output!] }),
+      dogePayment.address!,
+      'testnet',
+      { shape: 'sweep', treasuryPin: dogeTreasury.address! },
+      'bitcoin',
+    ),
+  )
+  assert.throws(() =>
+    signBitcoin(btcKey.toWIF(), psbt({ outputs: [btcTreasury.output!] }), btcPayment.address!, 'testnet', BTC_SWEEP, 'dogecoin'),
+  )
+})
+
+test('DOGECOIN: a segwit chain still requires a witnessUtxo — the two paths did not merge', () => {
+  // The legacy branch is selected by the CHAIN, so Bitcoin must be unaffected: an input carrying
+  // only the previous transaction is still refused there, because a segwit signature commits to the
+  // value and bitcoinjs would have to be trusted to find it.
+  const prev = dogePrevTx(btcPayment.output!, 100_000)
+  const p = new bitcoin.Psbt({ network: btcNetwork })
+  p.addInput({ hash: prev.getHash(), index: 0, nonWitnessUtxo: prev.toBuffer() })
+  p.addOutput({ script: btcTreasury.output!, value: 90_000 })
+  assert.throws(
+    () => signBitcoin(btcKey.toWIF(), p.toBase64(), btcPayment.address!, 'testnet', BTC_SWEEP, 'bitcoin'),
+    (err: unknown) => err instanceof SignRefused && /has no witnessUtxo/.test((err as Error).message),
+  )
+})
+
+/* ══════════════════════════════════════════════════════════════════════════════════════════════
+ * ETHEREUM CLASSIC — the gas rule, at the level where it is enforced.
+ *
+ * Which chains are legacy-only is decided in `chains.ts` and asserted in `hd.test.ts`; what
+ * `legacyOnly` then DOES is here. The two halves are separate on purpose: a correct list wired to a
+ * policy that ignores it, or a correct policy fed by a family test that answers wrongly for ETC,
+ * both produce the same outcome — a signature over a type-2 transaction that no ETC node accepts,
+ * recorded in the audit table as though it had worked.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+
+const ETC_CHAIN_ID = 61
+
+test('ETC: an EIP-1559 transaction is refused on a legacy-only chain', async () => {
+  const message = await refusal(() =>
+    signEvm(evmWallet.privateKey, transferTx({ chainId: ETC_CHAIN_ID }), {
+      chainId: ETC_CHAIN_ID,
+      shape: 'transfer',
+      legacyOnly: true,
+    }),
+  )
+  assert.match(message, /legacy transactions only/)
+})
+
+test('ETC: the same transfer with gasPrice signs, and binds ETC chain id', async () => {
+  const legacy = transferTx({ chainId: ETC_CHAIN_ID, gasPrice: '1000000000' })
+  delete (legacy as Record<string, unknown>).maxFeePerGas
+  delete (legacy as Record<string, unknown>).maxPriorityFeePerGas
+  const { signedTx } = await signEvm(evmWallet.privateKey, legacy, {
+    chainId: ETC_CHAIN_ID,
+    shape: 'transfer',
+    legacyOnly: true,
+  })
+  const parsed = ethers.Transaction.from(signedTx)
+  assert.equal(parsed.chainId, BigInt(ETC_CHAIN_ID))
+  assert.equal(parsed.gasPrice, 1_000_000_000n)
+
+  /*
+   * NOT TYPE 2 — and that is the assertion, rather than "type 0". Measured 2026-08-09: ethers infers
+   * type 1 for a `gasPrice` transaction that does not state a `type`, and type 1 is valid on ETC,
+   * which took EIP-2718 and EIP-2930 in ECIP-1103 ("Magneto", mainnet block 13,189,133). It is only
+   * London's fee model ETC lacks. Asserting `type === 0` here would be asserting something this
+   * service does not enforce and does not need to.
+   */
+  assert.notEqual(parsed.type, 2)
+  assert.equal(parsed.maxFeePerGas, null)
+})
+
+test('ETC: a caller that states type 0 gets type 0, which is what EMBER needs', async () => {
+  // The `type` field is the CALLER's, and `signEvm` only checks that it agrees with the fee model.
+  // A chain whose node predates EIP-2718 — EMBER, per its own policy comment — therefore has to send
+  // `type: 0` explicitly rather than rely on this flag, and this asserts that doing so works.
+  const legacy = transferTx({ chainId: ETC_CHAIN_ID, gasPrice: '1000000000', type: 0 })
+  delete (legacy as Record<string, unknown>).maxFeePerGas
+  delete (legacy as Record<string, unknown>).maxPriorityFeePerGas
+  const { signedTx } = await signEvm(evmWallet.privateKey, legacy, {
+    chainId: ETC_CHAIN_ID,
+    shape: 'transfer',
+    legacyOnly: true,
+  })
+  assert.equal(ethers.Transaction.from(signedTx).type, 0)
 })

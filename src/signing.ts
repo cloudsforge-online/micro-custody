@@ -28,7 +28,14 @@ import { ethers } from 'ethers'
 import { Keypair, PublicKey, Transaction as SolanaTransaction, type TransactionInstruction } from '@solana/web3.js'
 import * as bitcoin from 'bitcoinjs-lib'
 import { Wallet as XrplWallet, type Transaction as XrplTransaction } from 'xrpl'
-import { ECPair, bitcoinNetwork, type KeyNetwork } from './chains.ts'
+import { ECPair, bitcoinAddressKind, bitcoinNetwork, bitcoinPayment, type KeyNetwork } from './chains.ts'
+
+/**
+ * The PSBT input record, named locally so the two prevout helpers can be typed. It is bip174's
+ * `PsbtInput`, which bitcoinjs-lib does not re-export, so it is reached through the class it is
+ * already reachable from rather than by adding a direct dependency on bip174's internal path.
+ */
+type PsbtInput = bitcoin.Psbt['data']['inputs'][number]
 
 export class SignRefused extends Error {
   constructor(message: string) {
@@ -831,8 +838,10 @@ function assertAtaCreation(ix: TransactionInstruction, payer: PublicKey): void {
 export type BitcoinPolicy = { readonly shape: 'payment' } | { readonly shape: 'sweep'; readonly treasuryPin: string }
 
 /**
- * Fee-rate ceilings, in satoshis per virtual byte. Burn ceilings, not estimates — the same kind of
- * number as `XRP_MAX_FEE_DROPS`, set far above any real fee and far below a loss worth causing.
+ * Fee-rate ceilings, in the chain's own base unit per virtual byte — satoshis for BTC, litoshis for
+ * LTC, koinu for DOGE. All three have eight decimals, so the unit is the same size everywhere and it
+ * is only the fee markets that differ. Burn ceilings, not estimates — the same kind of number as
+ * `XRP_MAX_FEE_DROPS`, set far above any real fee and far below a loss worth causing.
  *
  * **THE SWEEP CEILING IS THE TIGHTER ONE, AND IT IS THERE BECAUSE THE PIN ALONE IS NOT ENOUGH.**
  * Pinning the destination stops a sweep paying an attacker. It does NOT stop a sweep paying the
@@ -854,18 +863,63 @@ export type BitcoinPolicy = { readonly shape: 'payment' } | { readonly shape: 's
  * treasury funds to an address a user names, so bounding what it may pay a miner bounds nothing that
  * is not already unbounded. Tightening it would only refuse a legitimate high-fee withdrawal during
  * congestion — a real cost for no gain, and a withdrawal, unlike a sweep, has a user waiting.
+ *
+ * **THE CEILINGS ARE PER-CHAIN AND THEY USED TO BE TWO CONSTANTS**, because until DOGE every
+ * bitcoin-family chain custody signed for had a fee market shaped like Bitcoin's. Dogecoin's is
+ * not: `dogecoin/dogecoin`, `src/policy/policy.h`, read at `master` on 2026-08-09, sets
+ * `RECOMMENDED_MIN_TX_FEE = COIN / 100` — 0.01 DOGE per kB, which is **1000 koinu/vB**, exactly the
+ * Bitcoin sweep ceiling. So a Dogecoin sweep paying Core's own recommended fee would have hit
+ * `feeRate >= ceiling` and been refused, and every Dogecoin sweep after it, forever: not a stall
+ * that clears when fees fall, because that rate is set by policy rather than by a market and there
+ * is no cheaper block to wait for. The deposits would simply never be swept.
+ *
+ * DOGE's numbers are Core's recommended rate times ten, keeping the same 1:5 sweep-to-payment ratio
+ * as Bitcoin's pair. Ten is the headroom for a future policy change (the constant has been cut
+ * before — `DEFAULT_MIN_RELAY_TX_FEE` is `RECOMMENDED_MIN_TX_FEE / 10`, so the floor and the
+ * recommendation are already a decade apart) and it still bounds the burn tightly in value terms: a
+ * one-input one-output sweep is about 192 bytes, so the ceiling caps the fee at ~0.02 DOGE.
  */
-const MAX_SWEEP_FEE_RATE = 1_000
-const MAX_PAYMENT_FEE_RATE = 5_000
+interface FeeRateCeilings {
+  readonly sweep: number
+  readonly payment: number
+}
+
+const FEE_RATE_CEILINGS: Readonly<Record<string, FeeRateCeilings>> = Object.freeze({
+  bitcoin: { sweep: 1_000, payment: 5_000 },
+  litecoin: { sweep: 1_000, payment: 5_000 },
+  dogecoin: { sweep: 10_000, payment: 50_000 },
+})
+
+/**
+ * The ceilings for a chain, or a throw.
+ *
+ * Unreachable in practice — `bitcoinNetwork` has already refused an unknown chain by the time this
+ * runs — but it is written as a throw rather than a fallback to Bitcoin's numbers so that the next
+ * bitcoin-family chain cannot inherit a fee bound that was measured against a different coin's fee
+ * market. That inheritance is the bug this whole block documents.
+ */
+function feeRateCeilings(chain: string): FeeRateCeilings {
+  const ceilings = FEE_RATE_CEILINGS[chain]
+  if (!ceilings) throw new Error(`no psbt fee-rate ceilings are defined for '${chain}'`)
+  return ceilings
+}
 
 /**
  * Bitcoin: sign a base64 PSBT → finalised raw transaction hex.
  *
  * A PSBT rather than a raw transaction because a segwit signature commits to the VALUE of each
  * input, and only the PSBT carries it: handed a bare transaction this service would be signing
- * amounts it cannot see. Every input must be a P2WPKH output of this very address, so it can only
- * ever spend its own coins — under `payment` the destination is the caller's business, the source
- * never is.
+ * amounts it cannot see. Every input must be an output of this very address, so it can only ever
+ * spend its own coins — under `payment` the destination is the caller's business, the source never
+ * is.
+ *
+ * **THE INPUT KIND IS THE CHAIN'S, NOT ALWAYS P2WPKH.** Dogecoin has no segwit (see `chains.ts`), so
+ * its inputs are P2PKH and carry their previous transaction whole in `nonWitnessUtxo` rather than a
+ * single prevout in `witnessUtxo`. That changes what "its value is unknown" means: for a P2WPKH
+ * input the value is a field, for a P2PKH one it has to be looked up in the supplied previous
+ * transaction, and the previous transaction has to be shown to be the right one first. Both branches
+ * end at the same two questions — what is this input worth, and does it pay us — and neither is
+ * allowed to be answered by the caller.
  *
  * SIGHASH_ALL ONLY. Anything else leaves part of the transaction unsigned and therefore editable
  * after the signature is handed back.
@@ -885,14 +939,15 @@ export function signBitcoin(
   network: KeyNetwork,
   policy: BitcoinPolicy,
   /**
-   * The chain NAME, from the row — `bitcoin` or `litecoin`.
+   * The chain NAME, from the row — `bitcoin`, `litecoin` or `dogecoin`.
    *
-   * **NOT DERIVABLE FROM THE FAMILY**, which is `'bitcoin'` for both. It selects the network
+   * **NOT DERIVABLE FROM THE FAMILY**, which is `'bitcoin'` for all three. It selects the network
    * parameters, and getting it wrong is not a subtle mispricing: `ECPair.fromWIF` throws outright
    * when the WIF's version byte disagrees (Litecoin's 176 against Bitcoin's 128), so a Litecoin key
    * presented under Bitcoin's parameters refuses rather than signing something regrettable. That
    * throw is the network binding doing its job, and it is why this parameter is required rather
-   * than defaulted.
+   * than defaulted. It now also selects the address kind and the fee-rate ceilings, both of which
+   * differ for Dogecoin, so the argument carries three decisions rather than one.
    */
   chain: string,
 ): string {
@@ -903,8 +958,11 @@ export function signBitcoin(
   // key can never be used to satisfy a testnet request.
   const keyPair = ECPair.fromWIF(wif, net)
   const pubkey = Buffer.from(keyPair.publicKey)
-  const own = bitcoin.payments.p2wpkh({ pubkey, network: net })
+  // The same builder derivation and provisioning use, so the script an input is checked against is
+  // byte-for-byte the one the address was published as. See `bitcoinPayment` in `chains.ts`.
+  const own = bitcoinPayment(pubkey, chain, network)
   if (own.address !== address) throw new Error(`decrypted bitcoin key does not match ${address}`)
+  const kind = bitcoinAddressKind(chain)
 
   const psbt = decodePsbt(payload, net, network)
   if (psbt.inputCount === 0) refuse('psbt has no inputs')
@@ -912,9 +970,8 @@ export function signBitcoin(
   if (policy.shape === 'sweep') assertSweepOutputs(psbt, policy.treasuryPin, net)
   psbt.data.inputs.forEach((input, i) => {
     if (input.finalScriptSig || input.finalScriptWitness) refuse(`psbt input ${i} is already finalized`)
-    const witnessUtxo = input.witnessUtxo
-    if (!witnessUtxo) refuse(`psbt input ${i} has no witnessUtxo — its value is unknown`)
-    if (!witnessUtxo.script.equals(own.output!)) refuse(`psbt input ${i} does not spend this vault address`)
+    const prevOut = kind === 'p2wpkh' ? witnessPrevOut(input, i) : legacyPrevOut(psbt, input, i)
+    if (!prevOut.script.equals(own.output)) refuse(`psbt input ${i} does not spend this vault address`)
     if (input.sighashType != null && input.sighashType !== bitcoin.Transaction.SIGHASH_ALL) {
       refuse(`psbt input ${i} asks for sighash ${input.sighashType}; only SIGHASH_ALL is signed`)
     }
@@ -922,7 +979,8 @@ export function signBitcoin(
 
   // The ceiling bitcoinjs would enforce inside `extractTransaction`, kept in step with the explicit
   // check below so the library's own guard stays a live backstop rather than a stale default.
-  const ceiling = policy.shape === 'sweep' ? MAX_SWEEP_FEE_RATE : MAX_PAYMENT_FEE_RATE
+  const ceilings = feeRateCeilings(chain)
+  const ceiling = policy.shape === 'sweep' ? ceilings.sweep : ceilings.payment
   psbt.setMaximumFeeRate(ceiling)
 
   psbt.signAllInputs(keyPair, [bitcoin.Transaction.SIGHASH_ALL])
@@ -945,11 +1003,79 @@ export function signBitcoin(
   }
   if (feeRate >= ceiling) {
     refuse(
-      `this psbt pays ${feeRate} sat/vB in fee, above the ${ceiling} this service will sign away — ` +
+      // Not "sat/vB": DOGE's base unit is the koinu and LTC's is the litoshi, and a refusal that
+      // names the wrong unit is a refusal an operator has to decode before they can act on it.
+      `this psbt pays ${feeRate} per vB in fee, above the ${ceiling} this service will sign away — ` +
         'check its output values',
     )
   }
   return psbt.extractTransaction().toHex()
+}
+
+/**
+ * The prevout a SEGWIT input spends, from the field that carries it.
+ *
+ * A P2WPKH signature commits to the input's value, so the value has to be present before anything
+ * is signed — that is the whole reason this service takes a PSBT and not a raw transaction.
+ */
+function witnessPrevOut(input: PsbtInput, i: number): { readonly script: Buffer } {
+  const witnessUtxo = input.witnessUtxo
+  if (!witnessUtxo) refuse(`psbt input ${i} has no witnessUtxo — its value is unknown`)
+  return witnessUtxo
+}
+
+/**
+ * The prevout a LEGACY (P2PKH) input spends, from the previous transaction it must carry whole.
+ *
+ * **THIS IS THE DOGECOIN PATH AND IT IS NOT A COSMETIC DIFFERENCE.** A pre-segwit signature does not
+ * commit to the input's value, so there is no field to read one out of: the only way to know what an
+ * input is worth, and whose script it pays, is to be given the transaction that created it and to
+ * check that it really is that transaction. bitcoinjs requires `nonWitnessUtxo` for exactly this
+ * reason and will not sign a legacy input without it.
+ *
+ * THE THREE REFUSALS BELOW EACH REPLACE A BARE `Error`, which matters more than it looks. Measured
+ * 2026-08-09 against the pinned `bitcoinjs-lib`: a P2PKH input supplied with only a `witnessUtxo`
+ * does not fail loudly — `signAllInputs` skips it and then throws `No inputs were signed`, a plain
+ * Error with no indication of which input or why. That reaches the route as a 500 and writes NO
+ * AUDIT ROW, and the rate limiter counts audit rows, so an unaudited path is one a caller can probe
+ * in a loop without ever being limited. The same argument the fee-rate check is written down for.
+ *
+ * The hash comparison is ours rather than bitcoinjs's even though bitcoinjs makes the same check
+ * later, because "later" is inside `signAllInputs` — after the ownership check has already compared
+ * this address's script against a script taken from a transaction that may be nothing to do with
+ * this input. Checking it here is what makes the ownership check mean anything at all.
+ */
+function legacyPrevOut(
+  psbt: bitcoin.Psbt,
+  input: PsbtInput,
+  i: number,
+): { readonly script: Buffer } {
+  const raw = input.nonWitnessUtxo
+  if (!raw) {
+    refuse(
+      `psbt input ${i} has no nonWitnessUtxo — this chain has no segwit, so a legacy input must ` +
+        'carry the whole transaction it spends or its value is unknown',
+    )
+  }
+  let prev: bitcoin.Transaction
+  try {
+    prev = bitcoin.Transaction.fromBuffer(raw)
+  } catch {
+    refuse(`psbt input ${i} carries a nonWitnessUtxo that is not a decodable transaction`)
+  }
+  // `data.inputs` and `txInputs` are the same list seen two ways, so this cannot miss; it is here
+  // because the index signature says it can, and a non-null assertion would hide a real change if
+  // that ever stopped being true.
+  const outpoint = psbt.txInputs[i]
+  if (!outpoint) throw new Error(`psbt input ${i} has no matching outpoint in the unsigned transaction`)
+  // `txInputs[i].hash` and `getHash()` are both internal (reversed) byte order, so they compare
+  // directly and neither has to be flipped into display order first.
+  if (!prev.getHash().equals(outpoint.hash)) {
+    refuse(`psbt input ${i} carries a nonWitnessUtxo that is not the transaction it spends`)
+  }
+  const prevOut = prev.outs[outpoint.index]
+  if (!prevOut) refuse(`psbt input ${i} spends output ${outpoint.index} of a transaction without one`)
+  return prevOut
 }
 
 /**
