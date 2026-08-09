@@ -40,6 +40,18 @@ const TOKENS = {
   // not hold". `settlement` may sweep deposits and may not touch the treasury.
   settlement: serviceToken('settlement', ['custody:sign:deposit', TREASURY_READ_SCOPE]),
   unscoped: serviceToken('marketing', ['pricing:read']),
+  /*
+   * A credential holding a scope NOTHING IN THE ESTATE CAN MINT.
+   *
+   * `custody:sign:pool` is in `scope-exemptions.json` as demandable-but-unregistered: /v1/sign
+   * synthesises the name from the purpose set, identity has no way to issue it, and every real
+   * caller is therefore refused at the scope check before a row is loaded — which is what the
+   * `pool` sign test above asserts. That refusal is real and it is also the SHALLOWER of the two
+   * walls, so on its own it hides the deeper one. Forging the scope here walks past it and reaches
+   * gate 1, so the suite states what happens if the scope registry ever changes its mind:
+   * `SIGNABLE_PURPOSES` still does not contain 'pool' and `purposeGate` still refuses.
+   */
+  poolsigner: serviceToken('pool', ['custody:sign:pool']),
   alice: userToken(ALICE),
   bob: userToken(BOB),
   operator: userToken('99999999-9999-4999-8999-999999999999', { roles: ['admin'] }),
@@ -884,6 +896,137 @@ test('the pin is readable by a scoped service and publishes only the address', {
   const response = await server.request('/v1/treasuries/ethereum/testnet', { token: 'wallet' })
   assert.equal(response.status, 200)
   assert.deepEqual(response.body, { chain: 'ethereum', network: 'testnet', address: treasury })
+})
+
+/* --------------------------- the pool payout address, micro-org#293 */
+
+/**
+ * The route that exists because no principal in the estate could mint a `pool` address.
+ *
+ * `POST /v1/addresses` is the only route that mints a purpose the caller names and its gate is
+ * `requireScope`, which `hasScope` refuses for every non-service principal — so an operator could
+ * never reach it. Nor could a service reach it honestly for THIS purpose: micro-pool never calls
+ * custody, so it holds no grant, and minting through wallet's credential writes `service:wallet`
+ * into `created_by` for the address every block reward on the platform pays into.
+ */
+const POOL_MINT = '/v1/admin/pool-payouts/litecoin/mainnet/mint'
+
+async function mintPoolPayout(path = POOL_MINT, token = 'operator') {
+  return server.request(path, { method: 'POST', token })
+}
+
+test('the pool payout mint is admin-only — a user token and a SCOPED service token are both refused', { skip }, async () => {
+  // The second assertion is the one that carries weight. `wallet` holds `custody:address:create`,
+  // which is the authority that mints every other address in this service, and it is REFUSED here —
+  // which is how the suite states that this route did not quietly become a second entrance to the
+  // signing surface's gate. Were it to have, the `created_by` column this route exists to keep
+  // honest would be back to naming a service that has never heard of the pool.
+  assert.equal((await mintPoolPayout(POOL_MINT, 'alice')).status, 403)
+  assert.equal((await mintPoolPayout(POOL_MINT, 'wallet')).status, 403)
+  assert.equal((await mintPoolPayout(POOL_MINT, 'unscoped')).status, 403)
+  const rows = await sql`select count(*)::int as n from custody_keys where purpose = 'pool'`
+  assert.equal(rows[0]!.n, 0, 'a refused mint creates nothing')
+})
+
+test('the pool payout mint refuses an unknown chain and a bad network, with the treasury route\'s codes', { skip }, async () => {
+  // `bitcoincash` is the estate's stand-in for a chain custody does not hold keys for — the same
+  // fixture the provisioning test above uses, so the two move together when it stops being unknown.
+  const unknown = await mintPoolPayout('/v1/admin/pool-payouts/bitcoincash/mainnet/mint')
+  assert.equal(unknown.status, 400)
+  assert.equal(errorOf(unknown).code, 'unknown_chain')
+
+  const network = await mintPoolPayout('/v1/admin/pool-payouts/litecoin/regtest/mint')
+  assert.equal(network.status, 400)
+  assert.equal(errorOf(network).code, 'bad_request')
+  assert.match(errorOf(network).message, /mainnet or testnet/)
+})
+
+test('a repeat pool payout mint returns the SAME address and creates nothing', { skip }, async () => {
+  // Migration 8 refused `unique (chain, network) where purpose = 'pool'` deliberately, so nothing in
+  // the schema enforces this: the idempotency is the route's derived binding and this is the test
+  // that says it works. Two calls a minute apart are the same request.
+  const first = await mintPoolPayout()
+  assert.equal(first.status, 201, first.text)
+  assert.equal(first.body.reused, false)
+  const second = await mintPoolPayout()
+  assert.equal(second.status, 200, second.text)
+  assert.equal(second.body.reused, true)
+  assert.equal((second.body.key as Record<string, unknown>).address, (first.body.key as Record<string, unknown>).address)
+
+  const rows = await sql`select count(*)::int as n from custody_keys where purpose = 'pool'`
+  assert.equal(rows[0]!.n, 1)
+})
+
+test('the minted row is purpose `pool`, flat random, and is NOT in custody_treasuries', { skip }, async () => {
+  const minted = await mintPoolPayout()
+  assert.equal(minted.status, 201, minted.text)
+  const key = minted.body.key as Record<string, unknown>
+  assert.equal(key.purpose, 'pool')
+  // A pool payout address belongs to the platform: there is no per-user seed to derive it from and
+  // no recovery phrase to offer anybody, which is the argument the treasury mint already makes.
+  assert.equal(key.scheme, 'flat_random')
+  assert.equal(key.derivationPath, null)
+  assert.equal('privateKey' in key, false)
+  // The operator projection, so an operator can see the binding the route derived. It is a SEPARATE
+  // binding from the treasury's, which is the point: `boundAsTreasury` compares against
+  // `treasuryBinding` and a colliding string would be one purpose check away from pinnable.
+  assert.equal(key.userId, 'cloudsforge:pool')
+  assert.equal(key.orderId, 'pool:litecoin:mainnet')
+  assert.notEqual(key.orderId, 'treasury:litecoin:mainnet')
+
+  // Migration 8's load-bearing sentence: a `pool` row must never appear in this table. The route
+  // pins nothing and the response says so.
+  assert.equal(minted.body.configured, false)
+  const pins = await sql`select address from custody_treasuries`
+  assert.equal(pins.length, 0)
+  const treasuries = await server.request('/v1/admin/treasuries', { token: 'operator' })
+  assert.deepEqual(treasuries.body.treasuries, [])
+})
+
+test('a minted pool payout address is refused at GATE 1 even by a forged custody:sign:pool', { skip }, async () => {
+  // The scope refusal is asserted above with `wallet`. This is the wall behind it: with the
+  // unmintable scope forged into the token, /v1/sign reaches `purposeGate`, `SIGNABLE_PURPOSES` is
+  // {deployer, treasury, deposit}, and the refusal is audited as gate `purpose` — before a key is
+  // decrypted. The coinbase is paid TO this address by the chain; spending from it is a decision
+  // nobody has made, and this route creating the address does not make it.
+  const minted = await mintPoolPayout()
+  const address = (minted.body.key as Record<string, unknown>).address as string
+  const response = await signRequest(
+    {
+      address,
+      chain: 'litecoin',
+      network: 'mainnet',
+      family: 'bitcoin',
+      purpose: 'pool',
+      userId: 'cloudsforge:pool',
+      orderId: 'pool:litecoin:mainnet',
+      payload: {},
+    },
+    'poolsigner',
+  )
+  assert.equal(response.status, 403, response.text)
+  assert.match(errorOf(response).message, /purpose this service does not sign for/)
+  const rows = await sql`select gate from signing_audit where address = ${address}`
+  assert.equal(rows[0]!.gate, 'purpose')
+})
+
+test('rotation stays reachable — retiring the live payout address makes the next mint a 201', { skip }, async () => {
+  // The property migration 8 refused the unique index to preserve, asserted rather than argued. A
+  // pool payout key accumulates every block the pool ever finds, so it is exactly the key an
+  // operator must be able to abandon and replace; under `unique (chain, network) where purpose =
+  // 'pool'` the replacement mint would be a 23505 no operator can act on.
+  const first = await mintPoolPayout()
+  const original = (first.body.key as Record<string, unknown>).address as string
+  await sql`update custody_keys set status = 'retired' where address = ${original}`
+
+  const replacement = await mintPoolPayout()
+  assert.equal(replacement.status, 201, replacement.text)
+  assert.equal(replacement.body.reused, false)
+  assert.notEqual((replacement.body.key as Record<string, unknown>).address, original)
+  // And the abandoned row is left alone, so the coin sitting at it still has a row saying who holds
+  // the key to it.
+  const rows = await sql`select status from custody_keys where address = ${original}`
+  assert.equal(rows[0]!.status, 'retired')
 })
 
 /* ------------------------------------------------------------------ the operator surface */

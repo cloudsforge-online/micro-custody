@@ -64,8 +64,10 @@ import {
   listSigningAudit,
   listTokenContracts,
   listTreasuryPins,
+  outstandingPoolPayout,
   outstandingTreasuryCandidate,
   pinTreasury,
+  poolPayoutBinding,
   signAttemptsSince,
   toKeyAdminRecord,
   toKeyRecord,
@@ -785,6 +787,121 @@ function buildRoutes(): Route[] {
           msg: 'it is NOT pinned and nothing sweeps to it yet — move the balance off the current treasury, then pin',
         })
         return { status: 201, body: { key: result.key, pinned: false, reused: false } }
+      },
+    },
+    {
+      method: 'POST',
+      path: '/v1/admin/pool-payouts/:chain/:network/mint',
+      /*
+       * Mint the MINING POOL'S PAYOUT ADDRESS, and deliberately tell nobody about it.
+       *
+       * The route above states the general form of the problem and this route is the second
+       * instance of it: `POST /v1/addresses` is the only route that mints a purpose the caller
+       * names, `hasScope` opens with `if (principal.kind !== 'service') return false`, and so an
+       * operator bearer can never pass its gate however many roles it carries. Nor can any service
+       * pass it FOR THIS PURPOSE: the three grants holding `custody:address:create` are foresight,
+       * mint and wallet, each derived from an outbound call it actually makes, and micro-pool makes
+       * none — it reads one string out of `POOL_<CHAIN>_PAYOUT_ADDRESS` and refuses to boot without
+       * it. So minting the pool's payout address without this route means borrowing wallet's
+       * credential, and `custody_keys.created_by` then records `service:wallet` for ever as the
+       * creator of the address every block reward on the platform pays into. The one column that
+       * answers "who made this" would name a service that has never heard of the pool.
+       *
+       * `requireAdmin`, therefore, and NOT the address scope — a human, named in `created_by` as a
+       * human. That is also why this is not a second entry point onto the signing surface's gate:
+       * a holder of `custody:address:create` is refused here, which `server.test.ts` asserts rather
+       * than assumes.
+       *
+       * `flat_random`, for the treasury route's reason. A pool payout address belongs to the
+       * platform rather than to a user, so there is no per-user seed for it to hang off and HD
+       * derivation would have to invent one; and there is no recovery phrase to offer anybody
+       * either, since nobody outside this service is ever entitled to this key. (The estate does
+       * hold HD `pool` keys minted by hand through `POST /v1/addresses` under a platform user id —
+       * they are legitimate and this route hands them back untouched. What it will not do is mint a
+       * NEW one that way.)
+       *
+       * ── IT PINS NOTHING, AND IT CONFIGURES NOTHING ───────────────────────────────────────────
+       *
+       * Nothing here touches `custody_treasuries`, and nothing may: migration 8's argument is that
+       * a `pool` row must never appear in that table, because `outstandingTreasuryCandidate` hands
+       * the newest unpinned treasury back as the next rotation candidate and micro-pool mines a
+       * chain settlement pins. `pool` is a purpose of its own precisely so that cannot happen, and
+       * this route is not the place it quietly starts happening.
+       *
+       * Telling micro-pool is likewise the operator's separate, deliberate step:
+       * `POOL_<CHAIN>_PAYOUT_ADDRESS` names the address, and until it does the address is inert —
+       * no coinbase is paid to it and nothing watches it. The response says so with
+       * `configured: false`, which is always false for the same reason the treasury mint's
+       * `pinned: false` always is. Note also that this service could not synthesise that variable's
+       * name even if it wanted to: micro-pool keys its chains as `btc` and `ltc` (`pool/src/env.ts`)
+       * where custody names them `bitcoin` and `litecoin`, so the variable for a litecoin address is
+       * `POOL_LTC_PAYOUT_ADDRESS`. Guessing across that mapping is how an operator is handed a
+       * variable name that does not exist.
+       *
+       * ── IT DOES NOT MINT TWICE, AND THE DATABASE IS NOT WHAT SAYS SO ─────────────────────────
+       *
+       * Everything written is derived from the path — `poolPayoutBinding` — so two calls a minute
+       * apart are the SAME request, and the second returns the first address with 200 and
+       * `reused: true`, creating nothing. That rule is `outstandingPoolPayout` and it is a QUERY on
+       * purpose: migration 8 refused `unique (chain, network) where purpose = 'pool'` in writing,
+       * because a pool payout key accumulates every block the pool ever finds and is therefore
+       * exactly the key an operator must be able to abandon and replace. Under that index the
+       * replacement mint is a 23505 no operator can act on. So the idempotency lives here, and this
+       * route must not become the thing that makes rotation impossible either: the reuse is filtered
+       * on `status = 'active'`, so retiring the row it hands back makes the next call a 201 and the
+       * abandoned row stays in `custody_keys` still saying who holds the coin at it.
+       */
+      handle: async (ctx, deps) => {
+        const principal = await authenticate(ctx, deps)
+        requireAdmin(principal)
+        const { chain, network } = ctx.params as { chain: string; network: string }
+        if (!NETWORKS.has(network)) return errorReply(400, 'bad_request', 'network must be mainnet or testnet', ctx.requestId)
+        if (!isKnownChain(chain) || !familyForChain(chain)) {
+          return errorReply(400, 'unknown_chain', `'${chain}' is not a chain this service holds keys for`, ctx.requestId)
+        }
+
+        const outstanding = await outstandingPoolPayout(deps.keys.sql, chain, network)
+        if (outstanding) {
+          ctx.log.info('pool payout mint reused the live payout address', {
+            audit: 'pool_payout_mint_reused',
+            chain,
+            network,
+            address: outstanding.address,
+          })
+          return { status: 200, body: { key: toKeyAdminRecord(outstanding), configured: false, reused: true } }
+        }
+
+        const binding = poolPayoutBinding(chain, network as KeyNetwork)
+        const result = await provisionAddress(deps.keys, {
+          chain,
+          network: network as KeyNetwork,
+          purpose: 'pool',
+          userId: binding.userId,
+          orderId: binding.orderId,
+          scheme: 'flat_random',
+          createdBy: actorOf(principal),
+          correlationId: ctx.requestId,
+        })
+        if (!result.ok) return errorReply(result.status, result.code, result.error, ctx.requestId)
+
+        ctx.log.warn('pool payout address minted', {
+          audit: 'pool_payout_minted',
+          chain,
+          network,
+          address: result.key.address,
+          msg:
+            'it is NOT configured anywhere and the pool will not use it until POOL_<CHAIN>_PAYOUT_ADDRESS ' +
+            'names it — set that, then restart micro-pool',
+        })
+        // Re-read rather than publish `provisionAddress`'s own return value, which is the PUBLIC
+        // projection: `toKeyAdminRecord` is what an operator surface serves, it is what the reuse
+        // branch above serves, and a route whose two branches answer with different field sets is a
+        // route every caller has to parse twice. What the admin projection adds is the binding, and
+        // the binding is the fact an operator investigating a platform-owned address needs most.
+        // Still never the key itself — this route creates key material and returns none.
+        const row = await getKey(deps.keys.sql, result.key.address)
+        if (!row) throw new Error('the pool payout address was not readable immediately after its own insert')
+        return { status: 201, body: { key: toKeyAdminRecord(row), configured: false, reused: false } }
       },
     },
     {

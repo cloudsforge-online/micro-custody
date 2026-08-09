@@ -519,6 +519,16 @@ function routeSamples(): Sample[] {
       token: 'operator',
       expect: 201,
     },
+    // Driven on litecoin because that is a chain micro-pool actually mines, and on mainnet because
+    // that is where its payout address lives. It mints a real `flat_random` key, so this sample is
+    // the scan asserting that the newest minting route returns no more than every older one does.
+    {
+      method: 'POST',
+      route: '/v1/admin/pool-payouts/:chain/:network/mint',
+      path: '/v1/admin/pool-payouts/litecoin/mainnet/mint',
+      token: 'operator',
+      expect: 201,
+    },
     {
       method: 'PUT',
       route: '/v1/admin/treasuries/:chain/:network',
