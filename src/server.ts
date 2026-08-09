@@ -111,7 +111,17 @@ const MAX_BODY_BYTES = 256 * 1024
 const MAX_IDEMPOTENCY_KEY_LENGTH = 255
 const SAFE_REQUEST_ID = /^[A-Za-z0-9_-]{1,64}$/
 const NETWORKS = new Set(['mainnet', 'testnet'])
-const PURPOSES = new Set<Purpose>(['deposit', 'treasury', 'deployer', 'user'])
+/**
+ * The purposes the mint route accepts. Kept equal to `custody_keys_purpose_ck` (migrations 4 and 8),
+ * so a value this set admits is a value the database will store rather than a 500 in the shape of a
+ * check violation.
+ *
+ * `pool` is here so micro-pool's coinbase payout address can be a custody key — see migration 8 for
+ * why it is a purpose of its own and, in particular, why it is not `treasury`. Accepting it here
+ * grants nothing beyond minting: `gates.SIGNABLE_PURPOSES` does not contain it, so /sign refuses a
+ * `pool` address at gate 1, and no `custody:sign:pool` scope is issued by anything in the estate.
+ */
+const PURPOSES = new Set<Purpose>(['deposit', 'treasury', 'deployer', 'user', 'pool'])
 const SCHEMES = new Set<Scheme>(['flat_random', 'hd_bip44'])
 
 /** Domain metrics, declared rather than inferred from a log line — AD-20. */

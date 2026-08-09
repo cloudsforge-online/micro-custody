@@ -119,6 +119,15 @@ export function coinTypeFor(family: KeyFamily, network: KeyNetwork, chain: strin
  * ed25519 has no public-key derivation, so SLIP-0010 permits hardened children only — which is why
  * the Solana path ends `…/<index>'/0'` rather than `…/0'/0/<index>`. That is the shape the Solana
  * CLI and every Solana wallet already use, so an exported phrase restores where a user expects.
+ *
+ * **PURPOSE IS NOT IN THE PATH, AND ADDING A PURPOSE MUST NOT PUT IT THERE.** The account level is
+ * fixed at `0'` for every purpose custody mints, including `pool` (migration 8); what separates two
+ * addresses is the address INDEX, allocated monotonically per (user, family) seed and never reused
+ * (`custody_seeds.next_index`), and what separates two owners is the seed itself, which is per
+ * `user_id`. So a fifth purpose needs no BIP-44 account number of its own and must not be given one:
+ * a number picked here is permanent — the address at `0'` and the address at `n'` are different
+ * addresses — and it would only restate a separation the index and the seed already provide, while
+ * making every existing row's path a special case for whoever restores from a phrase.
  */
 export function derivationPath(
   family: KeyFamily,

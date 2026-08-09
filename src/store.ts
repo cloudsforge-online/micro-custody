@@ -22,7 +22,20 @@
 import type { KeyNetwork } from './chains.ts'
 import type { Db, Tx } from './outbox.ts'
 
-export type Purpose = 'deposit' | 'treasury' | 'deployer' | 'user'
+/**
+ * What an address is FOR. Kept in step with `custody_keys_purpose_ck` (migrations 4 and 8) and with
+ * `PURPOSES` in `server.ts`, which is what the mint route will accept.
+ *
+ * `pool` is the newest and the one worth a sentence here, because its whole reason for existing is
+ * that none of the other four could hold it. micro-pool pays a found block's coinbase to the address
+ * in `POOL_<CHAIN>_PAYOUT_ADDRESS` (`pool/src/env.ts`), and 36-multi-chain-and-mining-pool §5.3 says
+ * found blocks are "the pool's revenue and the miners' claim on it" — so that output holds coin owed
+ * to people and the key under it has to be custodial. It is NOT `treasury`: a `treasury`-purpose key
+ * on a chain the pool mines is a rotation candidate for the settlement pin (`treasuryBinding` and
+ * `outstandingTreasuryCandidate`, below), and a pinned pool address turns every block it ever mined
+ * into unbooked custody inflow. Migration 8 carries the full argument and the incident behind it.
+ */
+export type Purpose = 'deposit' | 'treasury' | 'deployer' | 'user' | 'pool'
 export type Scheme = 'flat_random' | 'hd_bip44'
 export type KeyStatus = 'active' | 'exported' | 'retired'
 

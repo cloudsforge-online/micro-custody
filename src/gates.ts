@@ -61,6 +61,24 @@ import type { BitcoinPolicy, EvmPurposeShape, SolanaPolicy } from './signing.ts'
  * are not this one. `user` stays out. If it is ever revisited, the question to answer first is
  * "which field of the transaction does the VAULT choose", and if the answer is "none", the answer
  * to the widening is also none.
+ *
+ * ## `pool` IS OUT, AND THE TEST ABOVE IS WHY
+ *
+ * Migration 8 added the purpose so micro-pool's coinbase payout address can be a custody key. It is
+ * a RECEIVING address and nothing here signs for it, which is the whole capability the pool needs:
+ * the coinbase output is created by a block the pool mines, not by a transaction custody signs.
+ *
+ * Ask the question this file exists to ask. A spend from a pool payout address is a payout to
+ * miners: N destinations the caller names, for amounts computed off-chain from a share ledger custody
+ * cannot see. There is no field left for the VAULT to choose — not one — so by the rule stated
+ * three paragraphs up the answer to the widening is none, exactly as it is for `user`. Note also
+ * that the money is not stranded by that: 36 §5.3 pays miners by CREDITING THE LEDGER, reusing
+ * wallet's `credit_key` idempotency shape, so the pool's obligation to a miner is a ledger entry
+ * rather than a chain transaction, and the coin can sit at the payout address untouched.
+ *
+ * If a shape is ever needed here — moving the pool's own accumulated revenue somewhere — it is a
+ * shape whose destination this service pins, specified and BUILT before this set is widened, in that
+ * order. `SWEEPABLE_FAMILIES` below is what "specified, not built" cost the last time.
  */
 const SIGNABLE_PURPOSES: ReadonlySet<string> = new Set(['deployer', 'treasury', 'deposit'])
 

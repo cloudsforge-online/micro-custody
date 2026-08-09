@@ -117,6 +117,14 @@ export type ProvisionResult =
  * (`store.ts`) derives the binding from (chain, network) alone, so a rotation candidate is minted
  * under the SAME binding on purpose. Deduplicating it would leave a pinned treasury with nowhere to
  * rotate to.
+ *
+ * `pool` is excluded too, and this set must stay equal to migration 8's decision not to widen
+ * `custody_keys_binding_uniq` — the index is the invariant and this set is only the lookup that
+ * avoids reaching it, so a purpose in one and not the other is a replay this function promises and
+ * the database then refuses. The argument is migration 8's in full; in one line: a pool payout
+ * address's `order_id` is a string an operator chooses rather than the primary key of a row created
+ * once per address, so the binding names nothing, and a pool key accumulates block rewards and must
+ * stay re-mintable for rotation.
  */
 const BINDING_NAMES_ONE_ADDRESS: ReadonlySet<Purpose> = new Set<Purpose>(['deposit', 'deployer'])
 

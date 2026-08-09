@@ -207,6 +207,16 @@ candidate (`treasuryBinding`, `src/store.ts`); anything else is refused
 the EMBER testnet treasury candidate, which would have swept every user deposit into it
 (micro-org#250).
 
+**`purpose: 'pool'` is mintable and is never signed for.** It exists so micro-pool's
+`POOL_<CHAIN>_PAYOUT_ADDRESS` — where a found block's coinbase is paid, "the pool's revenue and the
+miners' claim on it" (36 §5.3) — is a key custody holds rather than one on the pool host. It is a
+purpose of its own rather than `treasury` because a `treasury` row on a chain the pool mines is a
+rotation candidate for the settlement pin, and a pinned pool address would turn every block ever
+mined to it into unbooked custody inflow. It is not in `SIGNABLE_PURPOSES`: a miner payout names
+destinations custody cannot choose, and 36 §5.3 pays miners by crediting the ledger. Nothing pins
+it, nothing dedupes it — a payout key accumulates block rewards and has to stay re-mintable for a
+rotation. Migration 8 carries the argument in full.
+
 `GET /v1/addresses/:address` publishes neither `userId` nor `orderId`. Publishing them made the
 `/sign` binding check circular: everything a caller had to "prove" it knew was served, under the same
 credential, from a read.
