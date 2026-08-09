@@ -39,9 +39,17 @@ const CHAIN_ASSET: Readonly<Record<string, AssetCode | null>> = Object.freeze({
   ethereum: 'ETH',
   bitcoin: 'BTC',
   litecoin: 'LTC',
+  dogecoin: 'DOGE',
   solana: 'SOL',
   xrp: 'XRP',
   ember: 'EMBER',
+  // Hyphenated, not `etc` and not `ethereumclassic`. The keys here are chain NAMES (see the file
+  // header), and the rest of the estate already spells this one out with a hyphen: the node datadir
+  // in `docs/ecosystem/36-multi-chain-and-mining-pool.md` is `/data/chains/ethereum-classic` and
+  // pricing's CoinGecko id in `pricing/src/sources.ts` is `ethereum-classic`. wallet's URL slug is
+  // the short `etc` because that side keys on the lowercased asset code; the translation between
+  // the two conventions is wallet's `CUSTODY_CHAIN` table, and it is the only place they meet.
+  'ethereum-classic': 'ETC',
   evm: null,
 })
 
@@ -78,6 +86,48 @@ export function expectedEvmChainId(chain: string, network: KeyNetwork): number |
   const asset = assetForChain(chain)
   if (!asset) return null
   return chainSpec(asset).chainId?.[network] ?? null
+}
+
+/**
+ * EVM chains that accept LEGACY (type 0) transactions ONLY — no EIP-1559, no `maxFeePerGas`.
+ *
+ * **THIS IS KEYED BY CHAIN AND IT USED TO BE KEYED BY FAMILY.** `keys.ts` built the signing policy
+ * with `legacyOnly: row.family === 'ember'`, which was correct while EMBER was the only pre-London
+ * EVM chain custody held keys for. `ChainFamily` for ETC is `'evm'`, the same value Ethereum
+ * carries, so the family test answers "1559 is fine" for a chain on which a type-2 transaction is
+ * not a valid transaction at all.
+ *
+ * The failure that would cause is worth spelling out, because it is not a rejected signature. The
+ * five gates would pass, the key would decrypt, ethers would happily produce a well-formed type-2
+ * envelope, custody would write a signing audit row saying it had signed, and the broadcast would
+ * fail at the node — leaving the platform with a recorded signature for a transaction that can
+ * never confirm and a treasury withdrawal stuck behind it.
+ *
+ * **ETC did not adopt London.** ECIP-1104 ("Mystique", mainnet block 14,525,000, 2022-02-13)
+ * activates exactly two of London's changes, EIP-3529 and EIP-3541, and its "Not Included" list
+ * names EIP-1559, EIP-3198 and EIP-3228 explicitly. Verified 2026-08-09 against the ECIP texts at
+ * `ethereumclassic/ECIPs`; `contracts/packages/chain` says the same thing in its ETC spec comment,
+ * which is where this requirement reached custody.
+ *
+ * **"LEGACY-ONLY" MEANS "NOT EIP-1559", NOT "NOT TYPED".** ETC did take Berlin: ECIP-1103
+ * ("Magneto", mainnet block 13,189,133, 2021-07-21) activates EIP-2718 and EIP-2930, so a type-1
+ * access-list transaction is perfectly valid there. What this flag forbids is the type-2 fee model,
+ * because there is no base fee for `maxFeePerGas` to be measured against. The distinction matters
+ * because ethers infers type 1 for a `gasPrice` transaction unless the caller states `type: 0`, so a
+ * flag that meant "type 0 only" would be describing something this service does not enforce.
+ *
+ * A chain that is NOT listed here is not thereby asserted to be post-London — it is only asserted
+ * to accept EIP-1559, which every EVM chain does whether or not it has a base fee. The list is the
+ * refusals, so adding a chain and forgetting it costs a legacy transaction on a 1559 chain (valid,
+ * merely overpriced) rather than a 1559 transaction on a legacy chain (invalid, unbroadcastable).
+ */
+const LEGACY_GAS_ONLY_CHAINS: ReadonlySet<string> = Object.freeze(
+  new Set(['ember', 'ethereum-classic']),
+)
+
+/** Whether a signed EVM transaction for this chain must be type 0. See `LEGACY_GAS_ONLY_CHAINS`. */
+export function isLegacyGasOnlyChain(chain: string): boolean {
+  return LEGACY_GAS_ONLY_CHAINS.has(chain)
 }
 
 /**
@@ -138,11 +188,116 @@ const LITECOIN_TESTNET: bitcoin.Network = Object.freeze({
   wif: 0xef,
 })
 
-const BITCOIN_FAMILY_NETWORKS: Readonly<Record<string, Readonly<Record<KeyNetwork, bitcoin.Network>>>> =
-  Object.freeze({
-    bitcoin: { mainnet: bitcoin.networks.bitcoin, testnet: bitcoin.networks.testnet },
-    litecoin: { mainnet: LITECOIN_MAINNET, testnet: LITECOIN_TESTNET },
-  })
+/**
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * DOGECOIN'S NETWORK PARAMETERS. **DOGECOIN HAS NO SEGWIT AND THEREFORE NO BECH32 ADDRESS.**
+ *
+ * Every byte below is from `dogecoin/dogecoin`, `src/chainparams.cpp`, read at `master` on
+ * 2026-08-09. The mainnet block sets PUBKEY_ADDRESS 30, SCRIPT_ADDRESS 22, SECRET_KEY 158; the
+ * testnet block sets 113, 196, 241. **There is no `bech32_hrp` line anywhere in that file** — not
+ * for main, test or regtest — because SegWit was never activated: it exists only as a BIP-9
+ * deployment whose timeout is 0, i.e. permanently off. That is not a gap in this table that someone
+ * should later fill in; there is no value to fill in.
+ *
+ * Two differences from the Litecoin block above, both checked rather than assumed:
+ *
+ *  1. **The BIP-32 version bytes are Dogecoin's own**, `0x02facafd` / `0x02fac398` — `dgub`/`dgpv`.
+ *     This is the opposite of Litecoin, whose Core uses Bitcoin's `xpub`/`xprv` and where the
+ *     distinct `Ltub` pair is only SLIP-0132's display convention. Here Core itself carries the
+ *     distinct bytes, so `dgub` is what an export would have to say to agree with the node. As with
+ *     Litecoin these bytes never appear in a derived address and this service never serialises an
+ *     extended key; they are correct so that a future export is correct.
+ *  2. **There is no `SCRIPT_ADDRESS2`.** Litecoin has two P2SH prefixes; Dogecoin has one.
+ *
+ * Testnet reuses Bitcoin's `tpub`/`tprv` bytes (`0x043587cf` / `0x04358394`) — that is what the file
+ * says, and it is a real collision rather than a transcription error, so it is recorded as read.
+ * Note also that Dogecoin's regtest prefixes (111 / 196 / 239) are NOT its testnet ones; custody
+ * has no regtest network, and this comment exists so that nobody adds one by copying these values.
+ *
+ * WHAT THE BYTES PRODUCE, measured 2026-08-09 by deriving with this table under the
+ * `bitcoinjs-lib` version this service pins: mainnet P2PKH `DL54i6msdfchWaR7NHFA41HxSiYciTwhqW`
+ * (a `D…`), mainnet P2SH `9ypNxDW…` (a `9…`), mainnet compressed WIF `QNrHeEx…` (a `Q…`), testnet
+ * P2PKH `nj88S7W…` (an `n…`), testnet compressed WIF `ceyd6dr…` (a `c…`).
+ *
+ * **THE TESTNET WIF IS NOT VISUALLY DISTINCT FROM BITCOIN'S.** Bitcoin testnet's 239 and Dogecoin
+ * testnet's 241 both yield compressed WIFs beginning `c`, so unlike the mainnet case a mix-up
+ * cannot be caught by eye. It is caught instead by `ECPair.fromWIF(wif, net)`, which compares the
+ * byte and throws — which is why `signing.ts` passes the chain's network in rather than decoding
+ * the WIF unbound.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+const DOGECOIN_MAINNET: bitcoin.Network = Object.freeze({
+  messagePrefix: '\x19Dogecoin Signed Message:\n',
+  /** dgub / dgpv — Dogecoin Core's own, unlike Litecoin. See the note above. */
+  bip32: { public: 0x02facafd, private: 0x02fac398 },
+  /**
+   * EMPTY BECAUSE DOGECOIN HAS NO BECH32 HRP, not because one is missing. `bitcoin.Network` makes
+   * the field required, so the absence has to be spelled some way, and the empty string is the only
+   * value that cannot be mistaken for a real HRP.
+   *
+   * It is NOT a safety net. Measured 2026-08-09: `bitcoin.payments.p2wpkh` with `bech32: ''` does
+   * not throw — it returned `1q50rtrmj2f8vl9tem8qpfw36ylw5jg9j2jp6y70`, a well-formed-looking string
+   * that is not an address on any chain. That is why the address KIND is an explicit per-chain
+   * choice below rather than something inferred from this field being blank.
+   */
+  bech32: '',
+  /** 30 → a legacy P2PKH address beginning `D`. This is the only address kind Dogecoin has. */
+  pubKeyHash: 0x1e,
+  /** 22 → `9` or `A`. Recorded for completeness; this service derives P2PKH and never P2SH. */
+  scriptHash: 0x16,
+  /** 158 → a compressed WIF beginning `Q`. Bitcoin's 128 gives `K`/`L`, so a mix-up is visible. */
+  wif: 0x9e,
+})
+
+const DOGECOIN_TESTNET: bitcoin.Network = Object.freeze({
+  messagePrefix: '\x19Dogecoin Signed Message:\n',
+  // tpub / tprv — Bitcoin's bytes, which is what Dogecoin Core's testnet block actually sets.
+  bip32: { public: 0x043587cf, private: 0x04358394 },
+  /** Still empty, and for the same reason: there is no segwit on any Dogecoin network. */
+  bech32: '',
+  /** 113 → an `n…`. */
+  pubKeyHash: 0x71,
+  /** 196 → a `2…`. Shared with Bitcoin testnet; unused here. */
+  scriptHash: 0xc4,
+  /** 241 → a compressed WIF beginning `c`, indistinguishable by eye from Bitcoin testnet's 239. */
+  wif: 0xf1,
+})
+
+/**
+ * The address kind a chain's keys are derived as.
+ *
+ * **THIS EXISTS BECAUSE THE FAMILY DOES NOT DETERMINE IT.** Every bitcoin-family chain custody held
+ * before DOGE was segwit-capable, so `p2wpkh` was hard-coded at all three sites that build an
+ * address — `generateFlatRandom` here, `deriveKey` in `hd.ts`, and the ownership check in
+ * `signBitcoin`. Dogecoin has no segwit at all, so those three had to stop guessing and start
+ * agreeing, which is what `bitcoinPayment` below is for: one function, three callers, so a chain
+ * cannot be derived as one kind and then verified as another.
+ *
+ * The kind is not merely cosmetic. It decides what a PSBT input must carry (`witnessUtxo` for
+ * P2WPKH, `nonWitnessUtxo` for P2PKH), which is why `signing.ts` reads it too.
+ */
+export type BitcoinAddressKind = 'p2wpkh' | 'p2pkh'
+
+interface BitcoinFamilyChain {
+  readonly kind: BitcoinAddressKind
+  readonly networks: Readonly<Record<KeyNetwork, bitcoin.Network>>
+}
+
+const BITCOIN_FAMILY_CHAINS: Readonly<Record<string, BitcoinFamilyChain>> = Object.freeze({
+  bitcoin: {
+    kind: 'p2wpkh',
+    networks: { mainnet: bitcoin.networks.bitcoin, testnet: bitcoin.networks.testnet },
+  },
+  litecoin: {
+    kind: 'p2wpkh',
+    networks: { mainnet: LITECOIN_MAINNET, testnet: LITECOIN_TESTNET },
+  },
+  // P2PKH is not a legacy preference here, it is the only option Dogecoin offers.
+  dogecoin: {
+    kind: 'p2pkh',
+    networks: { mainnet: DOGECOIN_MAINNET, testnet: DOGECOIN_TESTNET },
+  },
+})
 
 /**
  * bitcoinjs network for a (chain, network). The WIF carries it, so it is checked on decrypt.
@@ -159,14 +314,53 @@ const BITCOIN_FAMILY_NETWORKS: Readonly<Record<string, Readonly<Record<KeyNetwor
  * money. Failing at derivation time costs an obvious error; failing silently costs the deposit.
  */
 export function bitcoinNetwork(chain: string, network: KeyNetwork): bitcoin.Network {
-  const params = BITCOIN_FAMILY_NETWORKS[chain]
+  return bitcoinFamilyChain(chain).networks[network]
+}
+
+/** The address kind for a bitcoin-family chain. Throws for an unknown chain, as `bitcoinNetwork` does. */
+export function bitcoinAddressKind(chain: string): BitcoinAddressKind {
+  return bitcoinFamilyChain(chain).kind
+}
+
+function bitcoinFamilyChain(chain: string): BitcoinFamilyChain {
+  const params = BITCOIN_FAMILY_CHAINS[chain]
   if (!params) {
     throw new Error(
       `no bitcoin-family network parameters are defined for '${chain}' — refusing to derive an ` +
         'address with another chain parameters, which would be a valid address on the wrong chain',
     )
   }
-  return params[network]
+  return params
+}
+
+/**
+ * The single place a bitcoin-family address is built from a public key.
+ *
+ * Derivation (`hd.ts`), legacy generation (`generateFlatRandom`) and the ownership check in
+ * `signBitcoin` all route through here, so the address a deposit is published under and the address
+ * a signature is refused against are produced by the same code. When they were three separate
+ * `payments.p2wpkh` calls, adding a chain meant remembering three edits, and forgetting the third
+ * meant a key that mints an address it can never prove it owns.
+ *
+ * The `bech32` guard is defence in depth against a measured failure rather than a hypothetical one:
+ * `payments.p2wpkh` with an empty HRP returns a bogus address instead of throwing (see
+ * `DOGECOIN_MAINNET`), so a chain wrongly marked `p2wpkh` would otherwise mint garbage silently.
+ */
+export function bitcoinPayment(
+  pubkey: Buffer,
+  chain: string,
+  network: KeyNetwork,
+): { readonly address: string; readonly output: Buffer; readonly network: bitcoin.Network } {
+  const { kind, networks } = bitcoinFamilyChain(chain)
+  const net = networks[network]
+  if (kind === 'p2wpkh' && !net.bech32) {
+    throw new Error(`chain '${chain}' is marked segwit but has no bech32 HRP — refusing to derive`)
+  }
+  const payment =
+    kind === 'p2wpkh'
+      ? bitcoin.payments.p2wpkh({ pubkey, network: net })
+      : bitcoin.payments.p2pkh({ pubkey, network: net })
+  return { address: payment.address!, output: payment.output!, network: net }
 }
 
 export interface GeneratedKey {
@@ -215,10 +409,11 @@ export function generateFlatRandom(
     case 'bitcoin': {
       const net = bitcoinNetwork(chain, network)
       const keyPair = ECPair.makeRandom({ network: net })
-      const { address } = bitcoin.payments.p2wpkh({ pubkey: Buffer.from(keyPair.publicKey), network: net })
+      // Not `p2wpkh` directly: the kind is the chain's, and Dogecoin's is P2PKH. See `bitcoinPayment`.
+      const { address } = bitcoinPayment(Buffer.from(keyPair.publicKey), chain, network)
       // The WIF carries the network flag, so a later decrypt-and-sign stays unambiguous: a mainnet
       // key presented for a testnet request throws at `fromWIF` rather than signing.
-      return { address: address!, privateKey: keyPair.toWIF() }
+      return { address, privateKey: keyPair.toWIF() }
     }
     case 'xrp': {
       // XRP HAS NO NETWORK BYTE. A family seed generated here is valid on testnet and mainnet

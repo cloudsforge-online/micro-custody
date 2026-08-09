@@ -226,7 +226,10 @@ test('a legacy flat-random key stays mintable in the families that had them, and
 })
 
 test('an unknown chain is refused', { skip }, async () => {
-  const response = await mint({ chain: 'dogecoin', network: 'testnet', purpose: 'deposit', userId: ALICE, orderId: 'o1' })
+  // `dogecoin` used to stand in here and stopped being unknown when DOGE was added, at which point
+  // this test would still have passed while asserting nothing about an unknown chain. `bitcoincash`
+  // is the stand-in now; the next person to add that chain has to move the fixture again.
+  const response = await mint({ chain: 'bitcoincash', network: 'testnet', purpose: 'deposit', userId: ALICE, orderId: 'o1' })
   assert.equal(response.status, 400)
 })
 

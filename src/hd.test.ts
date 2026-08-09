@@ -24,11 +24,13 @@ import { deriveKey, derivationPath, coinTypeFor, isValidMnemonic, newMnemonic, s
 import {
   ECPair,
   assetForChain,
+  bitcoinAddressKind,
   bitcoinNetwork,
   expectedEvmChainId,
   familyForChain,
   generateFlatRandom,
   isKnownChain,
+  isLegacyGasOnlyChain,
 } from './chains.ts'
 
 /* ------------------------------------------------------------------ BIP-39 */
@@ -168,9 +170,11 @@ test('THE XRP FIX: testnet and mainnet derive DIFFERENT accounts from one seed',
 /** Every (family, chain) pair this service mints under. The chain is the authority, not the family. */
 const FAMILY_CHAINS = [
   ['evm', 'ethereum'],
+  ['evm', 'ethereum-classic'],
   ['ember', 'ember'],
   ['bitcoin', 'bitcoin'],
   ['bitcoin', 'litecoin'],
+  ['bitcoin', 'dogecoin'],
   ['solana', 'solana'],
   ['xrp', 'xrp'],
 ] as const
@@ -340,14 +344,19 @@ test('LITECOIN: an address of one chain does not decode as the other', () => {
 
 test('LITECOIN: a bitcoin-family chain with no parameters is refused, never defaulted to Bitcoin', () => {
   /*
-   * The next chain added to `CHAIN_ASSET` without its own entry in `BITCOIN_FAMILY_NETWORKS` must
-   * fail loudly at derivation. A default of Bitcoin's parameters is exactly the bug this whole
-   * change fixes, one family later, and it would be silent again.
+   * The next chain added to `CHAIN_ASSET` without its own entry in `BITCOIN_FAMILY_CHAINS` must fail
+   * loudly at derivation. A default of Bitcoin's parameters is exactly the bug this whole change
+   * fixes, one family later, and it would be silent again.
+   *
+   * The stand-in used to be `dogecoin`, which stopped being a chain with no parameters when DOGE was
+   * added — at which point this test would have passed only because Bitcoin Cash still has none. It
+   * is `bitcoincash` now, and the next person to add that chain has to move this fixture again
+   * rather than delete the assertion, because the assertion is the whole test.
    */
-  assert.throws(() => bitcoinNetwork('dogecoin', 'mainnet'), /no bitcoin-family network parameters/)
+  assert.throws(() => bitcoinNetwork('bitcoincash', 'mainnet'), /no bitcoin-family network parameters/)
   const seed = seedFromMnemonic(ABANDON)
-  assert.throws(() => deriveKey(seed, 'bitcoin', 'mainnet', 0, 'dogecoin'), /no bitcoin-family/)
-  assert.throws(() => generateFlatRandom('bitcoin', 'mainnet', 'dogecoin'), /no bitcoin-family/)
+  assert.throws(() => deriveKey(seed, 'bitcoin', 'mainnet', 0, 'bitcoincash'), /no bitcoin-family/)
+  assert.throws(() => generateFlatRandom('bitcoin', 'mainnet', 'bitcoincash'), /no bitcoin-family/)
 })
 
 test('LITECOIN: a flat-random key is Litecoin too, so the legacy scheme cannot mint a Bitcoin address', () => {
@@ -376,4 +385,190 @@ test('LITECOIN: custody accepts the chain, and resolves it to the bitcoin family
 
   // And it has no EVM chain id, so a signing request for it can never be mistaken for one.
   assert.equal(expectedEvmChainId('litecoin', 'mainnet'), null)
+})
+
+/* ══════════════════════════════════════════════════════════════════════════════════════════════
+ * DOGECOIN — the same question as Litecoin's, plus one Litecoin never raised: WHICH KIND OF
+ * ADDRESS.
+ *
+ * Litecoin could be got wrong only in its bytes; the shape was Bitcoin's, so `p2wpkh` was right for
+ * it. Dogecoin has no segwit at all, so a P2WPKH derivation is not merely encoded under the wrong
+ * parameters — it is an address of a kind the chain has never had a consensus rule for. And it does
+ * not fail: measured 2026-08-09 against the pinned `bitcoinjs-lib`, `payments.p2wpkh` with an empty
+ * HRP returned `1q50rtrmj2f8vl9tem8qpfw36ylw5jg9j2jp6y70` rather than throwing. So "it produced a
+ * string" proves nothing here and the assertions below are about the STRUCTURE of what it produced.
+ *
+ * Unlike Litecoin, a published key→address vector exists in the chain's OWN repository, so the
+ * primary assertion is a vector match rather than a set of structural properties.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+
+/**
+ * Dogecoin Core's own key test vectors: `src/test/key_tests.cpp` in `dogecoin/dogecoin`, read at
+ * `master` on 2026-08-09.
+ *
+ * `strSecret1C`/`addr1C` and `strSecret2C`/`addr2C` are the compressed pairs, `strSecret1`/`addr1`
+ * the uncompressed one. They are a PUBLISHED vector from the chain being encoded for, which is the
+ * whole of their value — a vector this repository computed would agree with any mistake this
+ * repository makes, and the Litecoin block above had to fall back on structural properties for
+ * exactly the want of one.
+ *
+ * They exercise both directions at once: `fromWIF` has to accept version byte 158, and the P2PKH
+ * encoder has to emit version byte 30, or the address comes out wrong.
+ */
+const DOGE_CORE_VECTORS = [
+  { wif: 'QP8WvtVMV2iU6y7LE27ksRspp4MAJizPWYovx88W71g1nfSdAhkV', address: 'D8jZ6R8uuyQwiybupiVs3eDCedKdZ5bYV3' },
+  { wif: 'QTuro8Pwx5yaonvJmU4jbBfwuEmTViyAGNeNyfnG82o7HWJmnrLj', address: 'DP7rGcDbpAvMb1dKup981zNt1heWUuVLP7' },
+  { wif: '6JFPe8b4jbpup7petSB98M8tcaqXCigji8fGrC8bEbbDQxQkQ68', address: 'DSpgzjPyfQB6ZzeSbMWpaZiTTxGf2oBCs4' },
+] as const
+
+test("DOGECOIN: Dogecoin Core's own published WIF-to-address vectors", () => {
+  const net = bitcoinNetwork('dogecoin', 'mainnet')
+  for (const { wif, address } of DOGE_CORE_VECTORS) {
+    const pubkey = Buffer.from(ECPair.fromWIF(wif, net).publicKey)
+    assert.equal(bitcoin.payments.p2pkh({ pubkey, network: net }).address, address)
+  }
+  // And none of those WIFs is importable under Bitcoin's or Litecoin's parameters, which is the
+  // network binding: version byte 158 is neither 128 nor 176 and `fromWIF` compares it.
+  for (const { wif } of DOGE_CORE_VECTORS) {
+    assert.throws(() => ECPair.fromWIF(wif, bitcoinNetwork('bitcoin', 'mainnet')))
+    assert.throws(() => ECPair.fromWIF(wif, bitcoinNetwork('litecoin', 'mainnet')))
+  }
+})
+
+test('DOGECOIN: the address this service mints is base58 P2PKH, never bech32', () => {
+  const seed = seedFromMnemonic(ABANDON)
+  const mainnet = deriveKey(seed, 'bitcoin', 'mainnet', 0, 'dogecoin')
+  const testnet = deriveKey(seed, 'bitcoin', 'testnet', 0, 'dogecoin')
+
+  // Version byte 30 → `D`, version byte 113 → `n` (or `m`). Both are asserted through a decode as
+  // well as through the leading character, because the leading character alone is a property of the
+  // first byte and the decode is a property of all twenty-five.
+  assert.equal(bitcoinAddressKind('dogecoin'), 'p2pkh')
+  assert.ok(mainnet.address.startsWith('D'), `expected a D… address, got ${mainnet.address}`)
+  assert.ok(/^[mn]/.test(testnet.address), `expected an m…/n… address, got ${testnet.address}`)
+  assert.ok(bitcoin.address.toOutputScript(mainnet.address, bitcoinNetwork('dogecoin', 'mainnet')))
+  assert.ok(bitcoin.address.toOutputScript(testnet.address, bitcoinNetwork('dogecoin', 'testnet')))
+
+  // THE ASSERTION THIS WHOLE BLOCK EXISTS FOR. A bech32 address on Dogecoin is unspendable, and the
+  // failure is silent at derivation — it surfaces as a deposit nobody can move.
+  assert.equal(mainnet.address.startsWith('doge1'), false)
+  assert.equal(mainnet.address.startsWith('bc1'), false)
+  assert.equal(testnet.address.startsWith('tb1'), false)
+  assert.equal(mainnet.address.startsWith('1q'), false, 'the empty-HRP bogus form must never appear')
+})
+
+test('DOGECOIN: the flat-random scheme mints the same kind of address as derivation', () => {
+  // Two code paths build an address and only one of them is exercised by the derivation tests. When
+  // they were separate `p2wpkh` calls, adding a chain meant remembering both.
+  const flat = generateFlatRandom('bitcoin', 'mainnet', 'dogecoin')
+  assert.ok(flat.address.startsWith('D'), `expected a D… address, got ${flat.address}`)
+  assert.ok(flat.privateKey.startsWith('Q'), 'a Dogecoin compressed WIF begins with Q')
+  assert.ok(ECPair.fromWIF(flat.privateKey, bitcoinNetwork('dogecoin', 'mainnet')))
+})
+
+test("DOGECOIN: coin type is SLIP-0044's 3, so DOGE, BTC and LTC are three keys from one seed", () => {
+  const seed = seedFromMnemonic(ABANDON)
+  const doge = deriveKey(seed, 'bitcoin', 'mainnet', 0, 'dogecoin')
+  const btc = deriveKey(seed, 'bitcoin', 'mainnet', 0, 'bitcoin')
+  const ltc = deriveKey(seed, 'bitcoin', 'mainnet', 0, 'litecoin')
+
+  assert.equal(doge.derivationPath, "m/44'/3'/0'/0/0")
+  assert.equal(coinTypeFor('bitcoin', 'mainnet', 'dogecoin'), 3)
+  // Distinct KEYS, not merely distinct encodings — which is what a recovery phrase depends on. A
+  // wallet restoring the phrase looks under m/44'/3' for Dogecoin and would find nothing there.
+  assert.equal(new Set([doge.privateKey, btc.privateKey, ltc.privateKey]).size, 3)
+})
+
+test('DOGECOIN: only the encoding differs — the pubkey hash is the same twenty bytes as Bitcoin', () => {
+  /*
+   * The check that says no arithmetic was invented, in the form the P2PKH kind allows: take ONE
+   * derived key and encode it under Dogecoin's and Bitcoin's parameters, and the hash160 must be
+   * identical. If it were not, something other than the encoding would be chain-dependent, which is
+   * the class of mistake that produces an address nobody holds the key to.
+   */
+  const node = HDKey.fromMasterSeed(new Uint8Array(seedFromMnemonic(ABANDON))).derive("m/44'/3'/0'/0/0")
+  const pubkey = Buffer.from(node.publicKey!)
+
+  const asDoge = bitcoin.payments.p2pkh({ pubkey, network: bitcoinNetwork('dogecoin', 'mainnet') })
+  const asBtc = bitcoin.payments.p2pkh({ pubkey, network: bitcoinNetwork('bitcoin', 'mainnet') })
+
+  assert.deepEqual(asDoge.hash, asBtc.hash, 'the pubkey hash must be the same twenty bytes')
+  assert.notEqual(asDoge.address, asBtc.address, 'and the encodings must still differ')
+  assert.ok(asDoge.address!.startsWith('D'))
+  assert.ok(asBtc.address!.startsWith('1'))
+})
+
+test('DOGECOIN: an address of one chain does not decode as the other', () => {
+  const seed = seedFromMnemonic(ABANDON)
+  const doge = deriveKey(seed, 'bitcoin', 'mainnet', 0, 'dogecoin').address
+  const btc = deriveKey(seed, 'bitcoin', 'mainnet', 0, 'bitcoin').address
+
+  // `toOutputScript` is what `assertSweepOutputs` turns a treasury pin into, so this is the property
+  // that makes a cross-chain sweep pin a refusal instead of a sweep that pays nobody.
+  assert.throws(() => bitcoin.address.toOutputScript(doge, bitcoinNetwork('bitcoin', 'mainnet')))
+  assert.throws(() => bitcoin.address.toOutputScript(btc, bitcoinNetwork('dogecoin', 'mainnet')))
+})
+
+test('DOGECOIN: custody accepts the chain, and resolves it to the bitcoin family', () => {
+  // The registry entry itself. Dropping it turns every DOGE deposit-address request into a 400 that
+  // reads like a caller error rather than a missing capability, and nothing else here would notice.
+  assert.equal(isKnownChain('dogecoin'), true)
+  assert.equal(assetForChain('dogecoin'), 'DOGE')
+  assert.equal(familyForChain('dogecoin'), 'bitcoin')
+  // No EVM chain id, so a signing request for it can never be mistaken for one.
+  assert.equal(expectedEvmChainId('dogecoin', 'mainnet'), null)
+})
+
+/* ══════════════════════════════════════════════════════════════════════════════════════════════
+ * ETHEREUM CLASSIC — identical to Ethereum in every byte of its address format, and different in
+ * the two things that decide whether a signature is valid: the chain id and the gas fields.
+ *
+ * There is nothing to derive differently, which is exactly why these tests exist. The failure here
+ * is not a malformed address, it is a WELL-FORMED transaction that no ETC node will accept, or an
+ * ETH key and an ETC key that turn out to be one key.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+
+test("ETC: coin type is SLIP-0044's 61, so an ETC key is not the user's ETH key", () => {
+  const seed = seedFromMnemonic(ABANDON)
+  const etc = deriveKey(seed, 'evm', 'mainnet', 0, 'ethereum-classic')
+  const eth = deriveKey(seed, 'evm', 'mainnet', 0, 'ethereum')
+
+  assert.equal(etc.derivationPath, "m/44'/61'/0'/0/0")
+  assert.equal(eth.derivationPath, "m/44'/60'/0'/0/0")
+  assert.equal(coinTypeFor('evm', 'mainnet', 'ethereum-classic'), 61)
+  // Without the CHAIN_COIN_TYPE override these would be the same key, the same address and the same
+  // private key, because the family is `'evm'` for both. A phrase exported from here would then
+  // restore ETC funds into a wallet that shows them under Ethereum.
+  assert.notEqual(etc.address, eth.address)
+  assert.notEqual(etc.privateKey, eth.privateKey)
+
+  // 61 here is SLIP-0044's coin type. That it equals ETC's EIP-155 chain id is a coincidence of two
+  // separate registries, and the chain id is read from `chainSpec` and never from this path.
+  assert.equal(expectedEvmChainId('ethereum-classic', 'mainnet'), 61)
+  assert.equal(expectedEvmChainId('ethereum-classic', 'testnet'), 63)
+})
+
+test('ETC: testnet takes coin type 1 like every other chain', () => {
+  // `ethereum-lists/chains` gives Mordor `"slip44": 1` in `eip155-63.json`, which is the same rule
+  // `coinTypeFor` already applies to everything, so ETC needs no testnet special case. Asserted so
+  // that adding one later is a visible decision.
+  assert.equal(coinTypeFor('evm', 'testnet', 'ethereum-classic'), 1)
+  const seed = seedFromMnemonic(ABANDON)
+  assert.equal(deriveKey(seed, 'evm', 'testnet', 0, 'ethereum-classic').derivationPath, "m/44'/1'/0'/0/0")
+})
+
+test('ETC: custody accepts the chain, resolves it to the evm family, and marks it legacy-gas-only', () => {
+  assert.equal(isKnownChain('ethereum-classic'), true)
+  assert.equal(assetForChain('ethereum-classic'), 'ETC')
+  assert.equal(familyForChain('ethereum-classic'), 'evm')
+
+  // THE ONE THAT WOULD OTHERWISE BE WRONG. ETC's family is `'evm'`, the same as Ethereum's, and the
+  // signing policy used to read the family — so ETC would have been told EIP-1559 was acceptable on
+  // a chain that never adopted London (ECIP-1104 omits it explicitly). The refusal has to be keyed
+  // by chain, and EMBER must keep its own.
+  assert.equal(isLegacyGasOnlyChain('ethereum-classic'), true)
+  assert.equal(isLegacyGasOnlyChain('ember'), true)
+  assert.equal(isLegacyGasOnlyChain('ethereum'), false)
 })
