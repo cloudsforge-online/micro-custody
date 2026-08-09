@@ -26,6 +26,7 @@ import {
   assetForChain,
   bitcoinAddressKind,
   bitcoinNetwork,
+  chainOutsideEveryRegistry,
   expectedEvmChainId,
   familyForChain,
   generateFlatRandom,
@@ -349,14 +350,17 @@ test('LITECOIN: a bitcoin-family chain with no parameters is refused, never defa
    * fixes, one family later, and it would be silent again.
    *
    * The stand-in used to be `dogecoin`, which stopped being a chain with no parameters when DOGE was
-   * added — at which point this test would have passed only because Bitcoin Cash still has none. It
-   * is `bitcoincash` now, and the next person to add that chain has to move this fixture again
-   * rather than delete the assertion, because the assertion is the whole test.
+   * added — at which point this test would have passed only because Bitcoin Cash still had none. It
+   * became `bitcoincash`, whose own comment admitted the problem: the next person to add that chain
+   * has to move the fixture again. It is now DERIVED from the registries themselves
+   * (`chainOutsideEveryRegistry`, micro-org#290), so no chain the estate adds can collide with it.
+   * `chains.ts` records what the derivation deliberately cannot produce and why that is the point.
    */
-  assert.throws(() => bitcoinNetwork('bitcoincash', 'mainnet'), /no bitcoin-family network parameters/)
+  const absent = chainOutsideEveryRegistry()
+  assert.throws(() => bitcoinNetwork(absent, 'mainnet'), /no bitcoin-family network parameters/)
   const seed = seedFromMnemonic(ABANDON)
-  assert.throws(() => deriveKey(seed, 'bitcoin', 'mainnet', 0, 'bitcoincash'), /no bitcoin-family/)
-  assert.throws(() => generateFlatRandom('bitcoin', 'mainnet', 'bitcoincash'), /no bitcoin-family/)
+  assert.throws(() => deriveKey(seed, 'bitcoin', 'mainnet', 0, absent), /no bitcoin-family/)
+  assert.throws(() => generateFlatRandom('bitcoin', 'mainnet', absent), /no bitcoin-family/)
 })
 
 test('LITECOIN: a flat-random key is Litecoin too, so the legacy scheme cannot mint a Bitcoin address', () => {

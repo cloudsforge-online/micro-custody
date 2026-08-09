@@ -13,6 +13,7 @@ import * as bitcoin from 'bitcoinjs-lib'
 import { PublicKey, SystemProgram, Transaction as SolanaTransaction } from '@solana/web3.js'
 import type postgres from 'postgres'
 import { ADDRESS_CREATE_SCOPE, TREASURY_READ_SCOPE } from './server.ts'
+import { chainOutsideEveryRegistry } from './chains.ts'
 import {
   ALICE,
   BOB,
@@ -34,6 +35,12 @@ import {
 } from './testsupport.ts'
 
 const SIGN_SCOPES = ['custody:sign:deposit', 'custody:sign:treasury', 'custody:sign:deployer']
+/**
+ * A chain custody holds no keys for, derived from the registry rather than named. See
+ * `chainOutsideEveryRegistry` in chains.ts for why a named one kept going stale (micro-org#290).
+ */
+const UNKNOWN_CHAIN = chainOutsideEveryRegistry()
+
 const TOKENS = {
   wallet: serviceToken('wallet', [ADDRESS_CREATE_SCOPE, TREASURY_READ_SCOPE, ...SIGN_SCOPES]),
   // Deliberately narrow: SD-05's "a test per service asserting it is refused on a scope it should
@@ -339,8 +346,9 @@ test('a legacy flat-random key stays mintable in the families that had them, and
 test('an unknown chain is refused', { skip }, async () => {
   // `dogecoin` used to stand in here and stopped being unknown when DOGE was added, at which point
   // this test would still have passed while asserting nothing about an unknown chain. `bitcoincash`
-  // is the stand-in now; the next person to add that chain has to move the fixture again.
-  const response = await mint({ chain: 'bitcoincash', network: 'testnet', purpose: 'deposit', userId: ALICE, orderId: 'o1' })
+  // replaced it and carried the same fuse. It is DERIVED from the registry now (micro-org#290), so
+  // the chain it names cannot become known behind this assertion's back.
+  const response = await mint({ chain: UNKNOWN_CHAIN, network: 'testnet', purpose: 'deposit', userId: ALICE, orderId: 'o1' })
   assert.equal(response.status, 400)
 })
 
@@ -929,9 +937,9 @@ test('the pool payout mint is admin-only — a user token and a SCOPED service t
 })
 
 test('the pool payout mint refuses an unknown chain and a bad network, with the treasury route\'s codes', { skip }, async () => {
-  // `bitcoincash` is the estate's stand-in for a chain custody does not hold keys for — the same
-  // fixture the provisioning test above uses, so the two move together when it stops being unknown.
-  const unknown = await mintPoolPayout('/v1/admin/pool-payouts/bitcoincash/mainnet/mint')
+  // The same derived fixture the provisioning test above uses, so the two cannot drift apart and
+  // neither can quietly stop naming an unknown chain.
+  const unknown = await mintPoolPayout(`/v1/admin/pool-payouts/${UNKNOWN_CHAIN}/mainnet/mint`)
   assert.equal(unknown.status, 400)
   assert.equal(errorOf(unknown).code, 'unknown_chain')
 

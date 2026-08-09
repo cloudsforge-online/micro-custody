@@ -334,6 +334,39 @@ function bitcoinFamilyChain(chain: string): BitcoinFamilyChain {
 }
 
 /**
+ * A chain name NEITHER registry in this file contains, DERIVED rather than chosen.
+ *
+ * ── WHY A FUNCTION SHIPS FOR SOMETHING ONLY TESTS CALL ────────────────────────────────────────
+ *
+ * Two assertions here need an example of "a chain this service does not hold keys for": the 400 on
+ * `POST /v1/addresses` in `server.test.ts`, and the refusal-rather-than-default in `hd.test.ts`
+ * that is the entire Litecoin fix. Both named a chain by hand, and both have already been edited
+ * once for that reason — `dogecoin` stood in each of them until DOGE was added, at which point
+ * `hd.test.ts` would have gone on passing for the wrong reason and `server.test.ts` would have
+ * asserted a 400 on a chain that is now perfectly mintable. `bitcoincash` replaced it, and its own
+ * comment admitted the problem: "the next person to add that chain has to move this fixture again".
+ *
+ * micro-org#290 adopts the derived form as the estate's answer: ask the registries at run time
+ * rather than predict them at authoring time. Collision is the loop's exit condition, so there is
+ * no chain this can collide with, now or ever.
+ *
+ * ── WHAT IT CANNOT DERIVE, WHICH IS ITSELF THE POINT ─────────────────────────────────────────
+ *
+ * `hd.test.ts` would ideally use a stronger fixture still: a chain that IS in `CHAIN_ASSET`, IS of
+ * the bitcoin family, and has no `BITCOIN_FAMILY_CHAINS` entry — the exact shape of the next
+ * mistake. No such chain can be derived, because none exists: bitcoin, litecoin and dogecoin all
+ * carry their parameters. That absence is the invariant the assertion defends, so a fixture that
+ * could be derived would mean the defect was already present. What is asserted instead is the
+ * mechanism — `bitcoinFamilyChain` throws for a name it does not hold rather than returning
+ * Bitcoin's — which is the thing that makes the stronger case fail loudly the day it can occur.
+ */
+export function chainOutsideEveryRegistry(): string {
+  let candidate = 'aaa'
+  while (isKnownChain(candidate) || Object.hasOwn(BITCOIN_FAMILY_CHAINS, candidate)) candidate += 'x'
+  return candidate
+}
+
+/**
  * The single place a bitcoin-family address is built from a public key.
  *
  * Derivation (`hd.ts`), legacy generation (`generateFlatRandom`) and the ownership check in
