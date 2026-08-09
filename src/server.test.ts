@@ -197,6 +197,105 @@ test('a second address for one user advances the index on the SAME seed', { skip
   assert.equal(seeds[0]!.n, 1)
 })
 
+test('a `pool` payout address is mintable on the chains the pool mines, and is HD', { skip }, async () => {
+  // What micro-pool needs and all it needs: an address to put in `POOL_<CHAIN>_PAYOUT_ADDRESS`
+  // whose private key custody holds, so a found block's coinbase — the pool's revenue and the
+  // miners' claim on it, 36 §5.3 — is not sitting under a key on the pool host.
+  //
+  // Driven on litecoin and bitcoin because those are the two chains micro-pool builds templates
+  // for, and litecoin is the one that makes the purpose necessary: settlement pins an LTC treasury,
+  // so a payout address minted as `treasury` here would be a rotation candidate for it.
+  for (const chain of ['litecoin', 'bitcoin']) {
+    const response = await mint({
+      chain,
+      network: 'mainnet',
+      purpose: 'pool',
+      userId: 'cloudsforge:pool',
+      orderId: `pool:${chain}:mainnet`,
+    })
+    assert.equal(response.status, 201, response.text)
+    const key = response.body.key as Record<string, unknown>
+    assert.equal(key.purpose, 'pool')
+    assert.equal(key.family, 'bitcoin')
+    assert.equal(key.scheme, 'hd_bip44')
+    assert.equal('privateKey' in key, false)
+  }
+  // The coin types are the chains' own — LTC 2, BTC 0 — and NOT the family's, which is Bitcoin's 0
+  // for both. Purpose is absent from the path entirely: the account level stays `0'` and what
+  // separates two addresses is the index on the (user, family) seed.
+  const paths = await sql<{ chain: string; derivation_path: string }[]>`
+    select chain, derivation_path from custody_keys where purpose = 'pool' order by chain
+  `
+  assert.deepEqual(
+    paths.map((row) => [row.chain, row.derivation_path]),
+    [
+      ['bitcoin', "m/44'/0'/0'/0/1"],
+      ['litecoin', "m/44'/2'/0'/0/0"],
+    ],
+  )
+})
+
+test('a `pool` address is never signed for, and no `custody:sign:pool` scope exists to ask with', { skip }, async () => {
+  // The other half of the purpose. Custody holds the key so the coin is not stranded under a key on
+  // the pool host; it does not sign payouts, because a payout names N miner destinations for amounts
+  // custody cannot see — no field is left for the vault to choose, which is the same answer `user`
+  // gets. 36 §5.3 pays miners by CREDITING THE LEDGER, so nothing is blocked by this refusal.
+  const minted = await mint({
+    chain: 'litecoin',
+    network: 'mainnet',
+    purpose: 'pool',
+    userId: 'cloudsforge:pool',
+    orderId: 'pool:litecoin:mainnet',
+  })
+  assert.equal(minted.status, 201, minted.text)
+  const address = (minted.body.key as Record<string, unknown>).address as string
+
+  // Refused at the SCOPE check, on the claimed purpose, before the row is loaded — so the route
+  // cannot be used to probe which addresses exist either. `wallet` holds every signing scope the
+  // estate issues and still cannot reach this one.
+  const response = await signRequest({
+    address,
+    chain: 'litecoin',
+    network: 'mainnet',
+    family: 'bitcoin',
+    purpose: 'pool',
+    userId: 'cloudsforge:pool',
+    orderId: 'pool:litecoin:mainnet',
+    payload: {},
+  })
+  assert.equal(response.status, 403)
+  assert.match(errorOf(response).message, /custody:sign:pool/)
+  const audit = await sql`select id from signing_audit where address = ${address}`
+  assert.equal(audit.length, 0, 'a scope refusal never reaches the row, so it writes no audit')
+})
+
+test('a `pool` address cannot be pinned as the treasury, through the route an operator actually has', { skip }, async () => {
+  // The schema half is in `migrations.test.ts`. This is the operator-facing half: the only write
+  // route to the pin is this one, it forwards an operator's own token, and it refuses a `pool`
+  // address by purpose before anything else. Were it not to, every LTC sweep in the estate would
+  // pay an address whose balance is the miners' claim on the pool's revenue.
+  const minted = await mint({
+    chain: 'litecoin',
+    network: 'mainnet',
+    purpose: 'pool',
+    userId: 'cloudsforge:pool',
+    orderId: 'pool:litecoin:mainnet',
+  })
+  assert.equal(minted.status, 201, minted.text)
+  const address = (minted.body.key as Record<string, unknown>).address as string
+
+  const pinned = await server.request('/v1/admin/treasuries/litecoin/mainnet', {
+    method: 'PUT',
+    token: 'operator',
+    body: { address },
+  })
+  assert.equal(pinned.status, 400, pinned.text)
+  assert.equal(errorOf(pinned).code, 'address_not_treasury')
+  assert.match(errorOf(pinned).message, /not purpose 'treasury'/)
+  const rows = await sql`select address from custody_treasuries`
+  assert.equal(rows.length, 0)
+})
+
 test('THE XRP FIX: a flat-random XRP key cannot be minted at all', { skip }, async () => {
   // The only path that could reintroduce SD-09's "one signed Payment is submittable on either
   // network" defect for a key this service creates.

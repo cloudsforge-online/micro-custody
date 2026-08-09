@@ -191,6 +191,23 @@ export interface RequestExportInput {
   readonly context: Record<string, unknown>
 }
 
+/**
+ * Purposes that belong to the platform rather than to a customer, and are therefore outside the
+ * user right this ceremony exists to serve (01-product-vision principle 2 is "a user can always
+ * leave with THEIR assets").
+ *
+ * Named as a set rather than left as a chain of `||` because it has grown, and because the thing it
+ * is easy to get wrong is forgetting to add to it. `pool` is the entry that made the difference:
+ * migration 8's payout address holds every coinbase micro-pool has ever mined, which
+ * 36-multi-chain-and-mining-pool §5.3 describes as the pool's revenue AND the miners' claim on it.
+ * The ownership test that matters here is not "does this row's `user_id` match the caller" — an
+ * operator minting the pool's address puts a string of their choosing in that column, and a
+ * customer's uuid landing there by accident or by design would otherwise hand a stranger the key to
+ * every miner's unpaid balance. Purpose is the fact that cannot be typed wrong by a caller, because
+ * `custody_keys_purpose_ck` bounds it.
+ */
+const PLATFORM_OWNED_PURPOSES: ReadonlySet<string> = new Set(['treasury', 'deployer', 'pool'])
+
 export async function requestExport(deps: ExportDeps, input: RequestExportInput): Promise<ExportResult<ExportRecord>> {
   const row = await getKey(deps.sql, input.address)
   if (!row) return fail(404, 'not_found', 'address not found')
@@ -200,7 +217,7 @@ export async function requestExport(deps: ExportDeps, input: RequestExportInput)
   if (row.status !== 'active') {
     return fail(409, 'not_exportable', `this address is '${row.status}' and cannot be exported again`)
   }
-  if (row.purpose === 'treasury' || row.purpose === 'deployer') {
+  if (PLATFORM_OWNED_PURPOSES.has(row.purpose)) {
     // Platform keys. They belong to no customer, so there is no user right to exercise over them,
     // and a route that could hand one out would be the deleted reveal route with extra steps.
     return fail(403, 'not_exportable', 'platform-owned addresses are not user-exportable')

@@ -415,6 +415,125 @@ export const MIGRATIONS: readonly Migration[] = [
       );
     `,
   },
+  {
+    version: 8,
+    name: 'pool_purpose',
+    /*
+     * A FIFTH PURPOSE — `pool`, THE ADDRESS A FOUND BLOCK'S COINBASE IS PAID TO.
+     *
+     * micro-pool builds Bitcoin-family block templates and pays the coinbase of every block it finds
+     * to the address in `POOL_<CHAIN>_PAYOUT_ADDRESS` (`pool/src/env.ts`), one per chain, validated
+     * against that chain's own node at boot. 36-multi-chain-and-mining-pool §5.3 states what lands
+     * there: found blocks are "the pool's revenue AND THE MINERS' CLAIM ON IT". So it is not an
+     * operating address holding the platform's own float — it holds coin that is owed to people, and
+     * a key under coin owed to people belongs in custody rather than in a wallet on the pool host.
+     *
+     * That is the whole of the change: one more legal value in `custody_keys_purpose_ck`. No table,
+     * no column, no index. Every line below this one is why it could not be an existing purpose and
+     * why it needs nothing more than this.
+     *
+     * ── WHY NOT ONE OF THE FOUR ──────────────────────────────────────────────────────────────
+     *
+     * `deposit` is owned by the wallet's deposit machinery end to end: an address carrying it is
+     * watched, credited to a user's ledger balance and swept to the settlement treasury. A coinbase
+     * landing on one would be read as a user's deposit and credited to whoever the row's `user_id`
+     * happened to name.
+     *
+     * `deployer` is contract deployment and is EVM-shaped — `evmShapeForPurpose` maps it to
+     * 'creation'. It has no meaning on a chain where the money arrives as a coinbase output.
+     *
+     * `user` is an end user's own key, exportable by them, and the pool's payout address is owned by
+     * no user.
+     *
+     * `treasury` IS THE DANGEROUS ONE AND IT IS WHY THIS MIGRATION IS WRITTEN THIS CAREFULLY. A
+     * `treasury`-purpose row is not merely a label: `outstandingTreasuryCandidate` (`store.ts`)
+     * selects `purpose = 'treasury'` on a (chain, network) and hands the newest unpinned one back as
+     * THE ROTATION CANDIDATE, and `pinTreasury` will then pin it. micro-pool's chains today are BTC
+     * and LTC (`pool/src/env.ts`), and settlement pins an LTC mainnet treasury — so a pool payout
+     * address minted as `treasury` on `litecoin` `mainnet` would be sitting in the candidate set for
+     * the next rotation of the very pin every LTC sweep pays.
+     *
+     * What that costs, measured rather than imagined: settlement books the pinned address's balance
+     * as platform equity from the moment it starts watching it, so every block the pool had already
+     * mined to that address would arrive as custody inflow no ledger entry explains. That is exactly
+     * the shape of the drift that froze EMBER withdrawals for three days from 2026-08-05 —
+     * micro-org#247 and #248, measured drift -25000020999999996000 — with the sign the other way
+     * round and a coinbase's worth of magnitude behind it. **A purpose that can be promoted into the
+     * settlement treasury must never be the pool's**, and the only way to be sure of that is for the
+     * pool's addresses not to carry it.
+     *
+     * ── AND WIDENING THIS CHECK CANNOT LET A `pool` ROW BE PINNED ─────────────────────────────
+     *
+     * The reason to be sure of this rather than to assume it: migration 5 made the pin a composite
+     * foreign key, and a foreign key that referenced the purpose SET rather than a purpose VALUE
+     * would have been widened by this migration without anybody touching it.
+     *
+     * It does not, because migration 5 names one literal in two places. `custody_treasuries.purpose`
+     * is held at exactly 'treasury' by `custody_treasuries_purpose_ck` — an equality, not a
+     * membership test, so nothing added here changes what that column may hold. And
+     * `custody_treasuries_key_fk` references `custody_keys (address, chain, network, purpose)` by
+     * VALUE. Put the two together: a pin row can only ever carry purpose 'treasury', and the FK then
+     * demands a `custody_keys` row with that same address, chain, network AND the literal purpose
+     * 'treasury'. A `pool` row carries 'pool' in that column, so it satisfies no such reference —
+     * the insert fails with a 23503 before any of custody's TypeScript is consulted.
+     *
+     * Three further walls stand in front of that one and none of them is what this argument rests
+     * on: `pinTreasury` refuses `row.purpose !== 'treasury'` outright, it also demands the platform
+     * treasury binding (micro-org#250), and `outstandingTreasuryCandidate` filters on both. They are
+     * code, and the estate's rule (03 §2) is that an invariant money depends on lives in the schema.
+     * Here it already does, and this migration is careful not to loosen it.
+     *
+     * ── THE UNIQUENESS DECISION: NOTHING, DELIBERATELY ───────────────────────────────────────
+     *
+     * Migration 6's `custody_keys_binding_uniq` covers `(chain, network, purpose, user_id, order_id)`
+     * `where purpose in ('deposit','deployer')`. `pool` is NOT added to it, and no index of its own is
+     * added either. Both candidates were considered:
+     *
+     * 1. ADD 'pool' TO THAT INDEX. Refused because it would not state anything true. Migration 6's
+     *    justification for the two purposes in it is specific: their `order_id` is the primary key of
+     *    a row the CALLER creates once per address it intends to exist — wallet's deposit assignment,
+     *    mint's token — so a second row under one binding cannot be anything but a duplicate mint.
+     *    Nothing plays that role for a pool payout address. Its `user_id` and `order_id` are strings
+     *    an operator chooses at mint time, so the index would say "one address per caller-chosen
+     *    order id", which `custody_keys_idempotency_uniq` already covers for any caller that sends a
+     *    key and which any caller can step around by changing one string. A constraint that does not
+     *    state the invariant is worse than no constraint, because it gets cited as though it did.
+     *
+     * 2. A STRONGER INDEX, `unique (chain, network) where purpose = 'pool'`. This one WOULD state the
+     *    real-world fact — a pool has one payout address per chain per network. It is refused for the
+     *    reason migration 6 gives for keeping `treasury` out of its index, and the reason applies
+     *    harder here. A pool payout key ACCUMULATES: every block ever found adds to it, so it is
+     *    precisely the key an operator must be able to abandon and replace — on a suspected
+     *    compromise, on an envelope rotation, on a change of pool operator. Under that index the
+     *    replacement mint fails, and the only routes left are mutating or deleting the live row,
+     *    which in this service means orphaning the coin at an address whose row no longer says who
+     *    holds it. Rotation must stay three deliberate steps (mint, move the balance, repoint), and a
+     *    unique index deletes the first one for ever after the first mint.
+     *
+     * SO NOTHING, AND THAT IS NOT A GAP. Custody does not know which of its `pool` addresses is live;
+     * it is not a fact this service holds. micro-pool reads exactly one address per chain from
+     * `POOL_<CHAIN>_PAYOUT_ADDRESS` and refuses to boot without it, so "one per chain and network" is
+     * enforced by configuration in the service that actually pays the coinbase. Custody has exactly
+     * one table that says "this address is the live one for this chain" — `custody_treasuries` — and
+     * the entire point of the argument above is that a `pool` row must never appear in it.
+     *
+     * ── RUNNING IT ───────────────────────────────────────────────────────────────────────────
+     *
+     * Drop then add, both inside the one transaction `@cloudsforge/db` wraps a migration in, so there
+     * is no instant at which `custody_keys` has no purpose check at all. The new check is strictly
+     * weaker than the one it replaces — same four values plus one — so every existing row satisfies
+     * it by construction and the validation scan cannot fail. `custody_keys` holds one row per address
+     * the platform has ever minted, so that scan is milliseconds; ALTER TABLE takes an
+     * AccessExclusiveLock and the migrator already holds an advisory lock of its own, so nothing is
+     * reading the table while it runs.
+     */
+    up: `
+      alter table custody_keys drop constraint if exists custody_keys_purpose_ck;
+      alter table custody_keys
+        add constraint custody_keys_purpose_ck
+          check (purpose in ('deposit','treasury','deployer','user','pool'));
+    `,
+  },
 ]
 
 /**

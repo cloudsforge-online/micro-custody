@@ -155,6 +155,132 @@ test('the treasury pin is a TREASURY address, on THIS chain and THIS network —
   assert.deepEqual(rows.map((r) => r.address), ['0xtreasury-eth-testnet'])
 })
 
+/* ------------------------------------------------------------------ migration 8: `pool` */
+
+test('migration 8: a `pool` key is storable, and the purpose check is still a closed set', { skip }, async () => {
+  // The capability micro-pool needs: an address whose private key custody holds, that the coinbase
+  // of a found block can be paid to (36-multi-chain-and-mining-pool §5.3).
+  await sql`
+    insert into custody_keys (address, chain, family, purpose, network, user_id, order_id, scheme,
+                              key_version, storage, created_by)
+    values ('ltc1qpool-mainnet', 'litecoin', 'bitcoin', 'pool', 'mainnet', 'cloudsforge:pool',
+            'pool:litecoin:mainnet', 'flat_random', 2, 'file', 'test')
+  `
+  const rows = await sql<{ purpose: string }[]>`select purpose from custody_keys where address = 'ltc1qpool-mainnet'`
+  assert.equal(rows[0]?.purpose, 'pool')
+
+  // Widened, not opened. The check is what keeps `purpose` a value the rest of the service can
+  // exhaustively reason about — `exports.PLATFORM_OWNED_PURPOSES` and `gates.SIGNABLE_PURPOSES` both
+  // decide by membership, so a typo that reached this column would silently be neither.
+  for (const typo of ['pools', 'POOL', 'mining', '']) {
+    await assert.rejects(
+      () => sql`
+        insert into custody_keys (address, chain, family, purpose, network, user_id, order_id, scheme,
+                                  key_version, storage, created_by)
+        values (${`addr-${typo}`}, 'litecoin', 'bitcoin', ${typo}, 'mainnet', 'u', 'o', 'flat_random',
+                2, 'file', 'test')
+      `,
+      /custody_keys_purpose_ck/,
+      typo,
+    )
+  }
+})
+
+test('migration 8: a `pool` address CANNOT be pinned as the settlement treasury', { skip }, async () => {
+  /*
+   * The reason migration 8 exists at all, asserted against the database rather than argued.
+   *
+   * The pool mines LTC, and settlement pins an LTC treasury. Had the payout address simply been
+   * minted with `purpose = 'treasury'`, it would have been a rotation CANDIDATE for that pin — and
+   * a pinned pool address turns every block the pool ever mined into custody inflow the ledger has
+   * no entry for. That is the shape of the drift that froze EMBER withdrawals for three days from
+   * 2026-08-05 (micro-org#247, #248), with a coinbase's magnitude behind it.
+   *
+   * Raw INSERTs, deliberately: `pinTreasury` refuses this too, and its refusal is not what is under
+   * test. What is under test is that migration 8's widening did not weaken migration 5's composite
+   * reference — the FK compares `purpose` by VALUE against the literal 'treasury', so a new legal
+   * purpose is a purpose no pin row can name.
+   */
+  const insertKeyRow = (address: string, purpose: string) => sql`
+    insert into custody_keys (address, chain, family, purpose, network, user_id, order_id, scheme,
+                              key_version, storage, created_by)
+    values (${address}, 'litecoin', 'bitcoin', ${purpose}, 'mainnet', 'cloudsforge:pool', 'o',
+            'flat_random', 2, 'file', 'test')
+  `
+  await insertKeyRow('ltc1qpool', 'pool')
+  await insertKeyRow('ltc1qtreasury', 'treasury')
+
+  await assert.rejects(
+    () => sql`
+      insert into custody_treasuries (chain, network, address, set_by)
+      values ('litecoin', 'mainnet', 'ltc1qpool', 'op')
+    `,
+    /custody_treasuries_key_fk/,
+  )
+  // Nor by naming the purpose the pin row would need in order to reach it: the column is held at
+  // 'treasury' by an EQUALITY, which nothing added to the keys check can widen.
+  await assert.rejects(
+    () => sql`
+      insert into custody_treasuries (chain, network, address, set_by, purpose)
+      values ('litecoin', 'mainnet', 'ltc1qpool', 'op', 'pool')
+    `,
+    /custody_treasuries_purpose_ck/,
+  )
+  // And the treasury on the same chain still pins, so this proves a constraint rather than a table
+  // that has stopped accepting anything.
+  await sql`
+    insert into custody_treasuries (chain, network, address, set_by)
+    values ('litecoin', 'mainnet', 'ltc1qtreasury', 'op')
+  `
+  const rows = await sql<{ address: string }[]>`select address from custody_treasuries`
+  assert.deepEqual(rows.map((r) => r.address), ['ltc1qtreasury'])
+})
+
+test('migration 8: the binding index does NOT cover `pool`, so a payout key stays re-mintable', { skip }, async () => {
+  /*
+   * The uniqueness decision, asserted so it is a decision rather than an oversight.
+   *
+   * `custody_keys_binding_uniq` still covers 'deposit' and 'deployer' only. A pool payout key
+   * ACCUMULATES — every block found adds to it — so it is exactly the key an operator must be able
+   * to abandon and replace on a suspected compromise. Under a binding index the replacement mint
+   * would fail and the only routes left would be mutating or deleting the live row, which in this
+   * service means orphaning the coin at an address whose row no longer says who holds it. This is
+   * migration 6's reason for keeping `treasury` out, one purpose later.
+   *
+   * Which of these two is the LIVE payout address is not a fact custody holds: micro-pool reads one
+   * address per chain from `POOL_<CHAIN>_PAYOUT_ADDRESS` and refuses to boot without it.
+   */
+  const insertPool = (address: string) => sql`
+    insert into custody_keys (address, chain, family, purpose, network, user_id, order_id, scheme,
+                              key_version, storage, created_by)
+    values (${address}, 'litecoin', 'bitcoin', 'pool', 'mainnet', 'cloudsforge:pool',
+            'pool:litecoin:mainnet', 'flat_random', 2, 'file', 'test')
+  `
+  await insertPool('ltc1qpool-first')
+  await insertPool('ltc1qpool-second')
+  const rows = await sql<{ n: number }[]>`
+    select count(*)::int as n from custody_keys where purpose = 'pool'
+  `
+  assert.equal(rows[0]?.n, 2, 'a rotation must be able to mint a second pool address')
+
+  // The index it is absent from is still doing its job for the two purposes that ARE one-per-binding.
+  await sql`
+    insert into custody_keys (address, chain, family, purpose, network, user_id, order_id, scheme,
+                              key_version, storage, created_by)
+    values ('ltc1qdeposit', 'litecoin', 'bitcoin', 'deposit', 'mainnet', 'u', 'assignment-1',
+            'flat_random', 2, 'file', 'test')
+  `
+  await assert.rejects(
+    () => sql`
+      insert into custody_keys (address, chain, family, purpose, network, user_id, order_id, scheme,
+                                key_version, storage, created_by)
+      values ('ltc1qdeposit-again', 'litecoin', 'bitcoin', 'deposit', 'mainnet', 'u', 'assignment-1',
+              'flat_random', 2, 'file', 'test')
+    `,
+    /custody_keys_binding_uniq/,
+  )
+})
+
 test('a signing audit row must be one of exactly two outcomes', { skip }, async () => {
   await assert.rejects(
     () => sql`

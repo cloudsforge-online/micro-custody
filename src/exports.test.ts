@@ -341,7 +341,13 @@ test('a wallet owned by someone else is 404, not 403', { skip }, async () => {
 })
 
 test('a platform-owned address is not user-exportable at all', { skip }, async () => {
-  for (const purpose of ['treasury', 'deployer'] as const) {
+  // `pool` is the third entry and the one with the sharpest failure mode. Migration 8's payout
+  // address holds every coinbase micro-pool has ever mined, which 36 §5.3 calls the pool's revenue
+  // AND the miners' claim on it — so exporting one would hand a single customer the key to every
+  // miner's unpaid balance. Note this case mints under ALICE's own id, which is what makes the
+  // assertion worth something: ownership is decided by PURPOSE here, not by `user_id`, because
+  // `user_id` on a platform address is a string whoever minted it chose.
+  for (const purpose of ['treasury', 'deployer', 'pool'] as const) {
     const minted = await provisionAddress(h.keys, {
       chain: 'ethereum',
       network: 'testnet',

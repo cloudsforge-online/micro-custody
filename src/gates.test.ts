@@ -46,6 +46,22 @@ test('gate 1: the three signable purposes and the one that is not', () => {
   assert.match(user.ok ? '' : user.error, /purpose this service does not sign for/)
 })
 
+test('gate 1: a `pool` address is NOT signed for — a payout has no field the vault chooses', () => {
+  // Migration 8 added the purpose so micro-pool's coinbase payout address can be a custody key. It
+  // is a RECEIVING address: the coinbase output is created by a block the pool mines, not by a
+  // transaction this service signs, so minting the key is the entire capability the pool needs.
+  //
+  // A spend from one would be a payout to miners — N destinations the caller names, for amounts
+  // computed from a share ledger custody cannot see — which leaves this service no field to pin, the
+  // same answer `user` gets. Asserted on every family, because the refusal must not depend on which
+  // signer happens to exist.
+  for (const family of ['bitcoin', 'evm', 'ember', 'solana', 'xrp']) {
+    const gate = purposeGate({ purpose: 'pool', family, status: 'active' })
+    assert.equal(gate.ok, false, family)
+    assert.match(gate.ok ? '' : gate.error, /purpose this service does not sign for/, family)
+  }
+})
+
 test('gate 1: a deposit address in a family with no sweep shape is refused before anything else', () => {
   // THE ALLOWLIST IS STILL AN ALLOWLIST, which is the whole reason the gate survives now that it
   // names every family custody currently holds keys for. `SIGNABLE_PURPOSES` contains `deposit`, so
@@ -100,6 +116,20 @@ test('the Solana and Bitcoin shapes are chosen by purpose, and their fallback ca
   // 'mint' and 'payment' would both still move money.
   assert.equal(solanaShapeForPurpose('something-new'), 'sweep')
   assert.equal(bitcoinShapeForPurpose('something-new'), 'sweep')
+})
+
+test('a `pool` purpose takes the fallback in all three mappings, and every fallback is the safe one', () => {
+  // `pool` is deliberately NOT given an entry in any of the three maps: an entry would read as "this
+  // purpose may select this shape", and gate 1 refuses it. What the fallbacks answer still matters,
+  // because `keys.shapeForRow` computes one BEFORE the gate runs, to label the refusal's audit row.
+  //
+  // The values are the fail-closed ones. On Bitcoin — the family the pool actually mines — it is
+  // 'sweep', which resolves no pin for a non-deposit purpose and therefore signs nothing at all; on
+  // EVM it is 'creation', which cannot move value. So even if gate 1 were removed tomorrow, a pool
+  // payout address would not be handed a shape that can spend a block reward.
+  assert.equal(bitcoinShapeForPurpose('pool'), 'sweep')
+  assert.equal(solanaShapeForPurpose('pool'), 'sweep')
+  assert.equal(evmShapeForPurpose('pool'), 'creation')
 })
 
 /* ------------------------------------------------------------------ gate 2 */
