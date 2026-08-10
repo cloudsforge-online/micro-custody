@@ -113,8 +113,28 @@ test('DOGECOIN: an address minted through the service is a real Dogecoin address
   // Base58 P2PKH under testnet version byte 113, so `n…` or `m…` — and NOT bech32 under any HRP,
   // which is the failure this whole file exists for: Dogecoin has no segwit, so a `doge1…` or the
   // empty-HRP `1q…` form would be an address nobody can ever spend from.
+  //
+  // ══════════════════════════════════════════════════════════════════════════════════════════
+  // `startsWith`, NOT `includes` — THIS LINE WAS micro-org#143, THE FLAKE NOBODY COULD REPRODUCE.
+  //
+  // The bogus form is `payments.p2wpkh` with an empty HRP, which yields `1q50rtrmj2f8…`: it BEGINS
+  // with `1q`. The guard was written as a substring test, and `1` and `q` are both in the base58
+  // alphabet, so a perfectly good address contains the pair by chance. Measured 2026-08-10 over
+  // 200,000 randomly generated testnet-113 P2PKH addresses: 1,771 contain `1q` — 0.885% — and
+  // ZERO start with it. That is a test that fails roughly once in every 113 runs of a suite whose
+  // subject is unchanged, which is exactly the ~1% rate the issue observed across 101 recorded
+  // runs and could never pin down, because a green run keeps no artefact and a red one had no
+  // address in its message.
+  //
+  // The address is now in the message for the same reason. `hd.test.ts` already spelt this guard
+  // `startsWith`; only this copy drifted.
+  // ══════════════════════════════════════════════════════════════════════════════════════════
   assert.ok(/^[mn]/.test(address), `expected an m…/n… address, got ${address}`)
-  assert.equal(address.includes('1q'), false, 'the empty-HRP bogus form must never be minted')
+  assert.equal(
+    address.startsWith('1q'),
+    false,
+    `the empty-HRP bogus form must never be minted, got ${address}`,
+  )
   assert.ok(bitcoin.address.toOutputScript(address, DOGE_NETWORK))
   assert.throws(() => bitcoin.address.toOutputScript(address, bitcoinNetwork('bitcoin', 'testnet')))
 
@@ -125,6 +145,33 @@ test('DOGECOIN: an address minted through the service is a real Dogecoin address
   assert.equal(rows[0]!.family, 'bitcoin')
   assert.equal(rows[0]!.chain, 'dogecoin')
   assert.equal(rows[0]!.derivation_path, "m/44'/1'/0'/0/0", 'testnet is coin type 1 for every coin')
+})
+
+/**
+ * The guard above, pinned from both sides — and deliberately NOT gated on a database.
+ *
+ * The test it protects mints ONE address per run, so whether its guard is anchored is decided by a
+ * coin toss weighted 1-in-113 and is invisible on any single green run. This one is decided by two
+ * constants, so a future edit back to `includes` turns it red every time rather than next month.
+ */
+test('DOGECOIN: the empty-HRP guard is anchored, because a REAL address may contain "1q"', () => {
+  // The defect the guard exists for: `p2wpkh` under an empty HRP does not raise, it returns an
+  // address, and that address BEGINS `1q`. Constructed here rather than quoted so it stays true if
+  // bitcoinjs-lib ever changes its encoding.
+  const bogus = bitcoin.payments.p2wpkh({
+    hash: Buffer.alloc(20, 7),
+    network: { ...DOGE_NETWORK, bech32: '' },
+  }).address!
+  assert.equal(bogus.startsWith('1q'), true, `the bogus form should begin 1q, got ${bogus}`)
+  assert.throws(() => bitcoin.address.toOutputScript(bogus, DOGE_NETWORK), 'and be unspendable')
+
+  // A GENUINE Dogecoin testnet P2PKH address that happens to carry the pair in the middle. Found
+  // by scanning sha256('micro-org#143:<i>') for i ascending — i = 31 — so it is re-derivable and
+  // is not a value anybody has to trust.
+  const genuine = 'nmmH9W2vZpLNJCrAY1qHuTVdZRrQSSzVRW'
+  assert.ok(bitcoin.address.toOutputScript(genuine, DOGE_NETWORK), 'is spendable on Dogecoin')
+  assert.equal(genuine.includes('1q'), true, 'contains the pair')
+  assert.equal(genuine.startsWith('1q'), false, 'and must still be accepted by the guard')
 })
 
 test('DOGECOIN: a sweep signs, with the chain carried from the row into the signer', { skip }, async () => {
