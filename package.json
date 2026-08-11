@@ -1,6 +1,6 @@
 {
   "name": "@cloudsforge/custody",
-  "version": "2.5.19",
+  "version": "2.5.20",
   "private": true,
   "description": "Key custody: HD seeds, key generation, the encryption envelope, the signing policy, treasury pins, the key lifecycle and the export ceremony.",
   "license": "MIT",
@@ -32,6 +32,7 @@
   "dependencies": {
     "@cloudsforge/auth": "file:../runtime/packages/auth",
     "@cloudsforge/contracts-chain": "link:../contracts/packages/chain",
+    "@cloudsforge/contracts-events": "link:../contracts/packages/events",
     "@cloudsforge/db": "file:../runtime/packages/db",
     "@cloudsforge/http": "file:../runtime/packages/http",
     "@cloudsforge/jobs": "file:../runtime/packages/jobs",
