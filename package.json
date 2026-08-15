@@ -1,6 +1,6 @@
 {
   "name": "@cloudsforge/custody",
-  "version": "2026.08.48",
+  "version": "2026.08.49",
   "private": true,
   "description": "Key custody: HD seeds, key generation, the encryption envelope, the signing policy, treasury pins, the key lifecycle and the export ceremony.",
   "license": "MIT",
