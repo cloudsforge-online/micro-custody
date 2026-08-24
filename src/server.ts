@@ -554,20 +554,42 @@ function buildRoutes(): Route[] {
         }
         if (request.payload === undefined) throw new BadRequestError('payload is required')
 
+        // ══════════════════════════════════════════════════════════════════════════════════════
+        // THE LABEL MUST BE BOUNDED, AND `request.network` IS RAW CALLER INPUT.
+        // ══════════════════════════════════════════════════════════════════════════════════════
+        //
+        // `stringField(body, 'network')` is whatever the caller sent. `signForAddress` refuses an
+        // unknown one at its binding check — but the counters below are incremented on the REFUSAL
+        // path too, so labelling them with the raw value hands any caller two things:
+        //
+        //   1. unbounded cardinality. A loop posting a fresh uuid as `network` mints a new time
+        //      series per request; 13-operational-model §13 budgets 500k active series for the
+        //      whole estate, and this route would spend them. The same reasoning is written on
+        //      beacon's `probes.target`: a metric label must be bounded by something the SERVICE
+        //      controls, never by something a caller does.
+        //
+        //   2. attribution they do not own. A caller could book its own refusals against whichever
+        //      estate it liked, which is the opposite of what this label was added for.
+        //
+        // `invalid` rather than dropping the label: it keeps the series bounded at three AND says
+        // something true and useful — "somebody is sending nonsense here" is a different alert
+        // from "testnet signing is failing", and collapsing them would hide the first.
+        const networkLabel = NETWORKS.has(request.network) ? request.network : 'invalid'
+
         const done = deps.lifecycle.track()
         try {
           const outcome = await signForAddress(deps.keys, request)
           if (!outcome.ok) {
             deps.metrics.increment('custody_signatures_total', {
-              network: request.network,
+              network: networkLabel,
               purpose: claimedPurpose,
               outcome: 'refused',
             })
-            deps.metrics.increment('custody_sign_refusals_total', { network: request.network, gate: outcome.gate })
+            deps.metrics.increment('custody_sign_refusals_total', { network: networkLabel, gate: outcome.gate })
             return errorReply(outcome.status, outcome.code, outcome.error, ctx.requestId)
           }
           deps.metrics.increment('custody_signatures_total', {
-            network: request.network,
+            network: networkLabel,
             purpose: claimedPurpose,
             outcome: 'signed',
           })
