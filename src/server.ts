@@ -131,21 +131,25 @@ export function registerServiceMetrics(metrics: Metrics): Metrics {
   return metrics
     .register({
       name: 'custody_signatures_total',
-      help: 'Signing requests, by purpose and outcome. A refusal is a signature that did not happen.',
+      help: 'Signing requests, by network, purpose and outcome. A refusal is a signature that did not happen.',
       kind: 'counter',
-      labels: ['purpose', 'outcome'],
+      // `network` because ONE custody now serves both estates (micro-deploy
+      // `docs/network-consolidation.md`). Without it a testnet signing refusal and a mainnet one
+      // are the same series — and on this service that is the difference between "somebody is
+      // probing our key material" and "the testnet faucet is misconfigured again".
+      labels: ['network', 'purpose', 'outcome'],
     })
     .register({
       name: 'custody_sign_refusals_total',
-      help: 'Signing refusals by the gate that refused them. A shift between gates is a caller changing shape.',
+      help: 'Signing refusals by network and by the gate that refused them. A shift between gates is a caller changing shape.',
       kind: 'counter',
-      labels: ['gate'],
+      labels: ['network', 'gate'],
     })
     .register({
       name: 'custody_addresses_created_total',
-      help: 'Addresses minted, by scheme. `flat_random` must never increase for XRP.',
+      help: 'Addresses minted, by network and scheme. `flat_random` must never increase for XRP.',
       kind: 'counter',
-      labels: ['scheme', 'purpose'],
+      labels: ['network', 'scheme', 'purpose'],
     })
     .register({
       name: 'custody_addresses_replayed_total',
@@ -154,7 +158,7 @@ export function registerServiceMetrics(metrics: Metrics): Metrics {
         'because a replay is not a mint: this rising while `created_total` does not is a caller ' +
         'retrying, and both rising together is a caller minting.',
       kind: 'counter',
-      labels: ['purpose'],
+      labels: ['network', 'purpose'],
     })
     .register({
       name: 'custody_rate_limited_total',
@@ -398,10 +402,10 @@ function buildRoutes(): Route[] {
             // 200 AND `reused`, the vocabulary the treasury mint route below already speaks. A 201
             // here would tell a caller — and every log, metric and dashboard reading the status —
             // that an address was created, which is the one thing that did not happen.
-            deps.metrics.increment('custody_addresses_replayed_total', { purpose })
+            deps.metrics.increment('custody_addresses_replayed_total', { network, purpose })
             return { status: 200, body: { key: result.key, reused: true } }
           }
-          deps.metrics.increment('custody_addresses_created_total', { scheme, purpose })
+          deps.metrics.increment('custody_addresses_created_total', { network, scheme, purpose })
           // NEVER the private key. The response is the secret-free projection and nothing else.
           return { status: 201, body: { key: result.key } }
         } finally {
@@ -550,15 +554,45 @@ function buildRoutes(): Route[] {
         }
         if (request.payload === undefined) throw new BadRequestError('payload is required')
 
+        // ══════════════════════════════════════════════════════════════════════════════════════
+        // THE LABEL MUST BE BOUNDED, AND `request.network` IS RAW CALLER INPUT.
+        // ══════════════════════════════════════════════════════════════════════════════════════
+        //
+        // `stringField(body, 'network')` is whatever the caller sent. `signForAddress` refuses an
+        // unknown one at its binding check — but the counters below are incremented on the REFUSAL
+        // path too, so labelling them with the raw value hands any caller two things:
+        //
+        //   1. unbounded cardinality. A loop posting a fresh uuid as `network` mints a new time
+        //      series per request; 13-operational-model §13 budgets 500k active series for the
+        //      whole estate, and this route would spend them. The same reasoning is written on
+        //      beacon's `probes.target`: a metric label must be bounded by something the SERVICE
+        //      controls, never by something a caller does.
+        //
+        //   2. attribution they do not own. A caller could book its own refusals against whichever
+        //      estate it liked, which is the opposite of what this label was added for.
+        //
+        // `invalid` rather than dropping the label: it keeps the series bounded at three AND says
+        // something true and useful — "somebody is sending nonsense here" is a different alert
+        // from "testnet signing is failing", and collapsing them would hide the first.
+        const networkLabel = NETWORKS.has(request.network) ? request.network : 'invalid'
+
         const done = deps.lifecycle.track()
         try {
           const outcome = await signForAddress(deps.keys, request)
           if (!outcome.ok) {
-            deps.metrics.increment('custody_signatures_total', { purpose: claimedPurpose, outcome: 'refused' })
-            deps.metrics.increment('custody_sign_refusals_total', { gate: outcome.gate })
+            deps.metrics.increment('custody_signatures_total', {
+              network: networkLabel,
+              purpose: claimedPurpose,
+              outcome: 'refused',
+            })
+            deps.metrics.increment('custody_sign_refusals_total', { network: networkLabel, gate: outcome.gate })
             return errorReply(outcome.status, outcome.code, outcome.error, ctx.requestId)
           }
-          deps.metrics.increment('custody_signatures_total', { purpose: claimedPurpose, outcome: 'signed' })
+          deps.metrics.increment('custody_signatures_total', {
+            network: networkLabel,
+            purpose: claimedPurpose,
+            outcome: 'signed',
+          })
           // The signature, and the id of the audit row committed with it. Nothing else — and in
           // particular not the key, not the payload and not the address's binding.
           return { status: 200, body: { signedTx: outcome.signedTx, auditId: outcome.auditId } }
