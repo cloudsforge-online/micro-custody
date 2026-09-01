@@ -16,7 +16,7 @@ import {
   type KeyFamily,
   type KeyNetwork,
 } from './chains.ts'
-import { deriveKey, newMnemonic, seedFromMnemonic } from './hd.ts'
+import { coinTypeFor, deriveKey, newMnemonic, seedFromMnemonic } from './hd.ts'
 import {
   bindingMatches,
   bindingMismatches,
@@ -216,7 +216,7 @@ export async function provisionAddress(deps: KeyDeps, input: ProvisionRequest): 
 
         if (scheme === 'hd_bip44') {
           const seed = await ensureSeed(deps, tx, input.userId, family)
-          const index = await takeNextIndex(tx, seed.id)
+          const index = await takeNextIndex(tx, seed.id, coinTypeFor(family, input.network, input.chain))
           const mnemonic = deps.keyring.decrypt(seedSlot(seed.id), await deps.vault.read(seedSlot(seed.id)))
           const derived = deriveKey(seedFromMnemonic(mnemonic), family, input.network, index, input.chain)
           seedId = seed.id

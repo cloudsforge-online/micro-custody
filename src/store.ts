@@ -308,15 +308,41 @@ export async function insertSeed(
   return rows[0] ?? null
 }
 
-/** Claim the next index under a row lock. See `findSeed` for why the lock is the whole point. */
-export async function takeNextIndex(sql: Tx, seedId: string): Promise<number> {
+/**
+ * Claim the next address index ON ONE DERIVATION PATH, under a row lock.
+ *
+ * The counter is per (seed, coin type) rather than per seed, because one seed serves several BIP-44
+ * paths at once -- `coinTypeFor` varies the coin type by network AND chain. A single counter shared
+ * across them interleaves the indexes and leaves each path with holes; twenty consecutive holes is
+ * the BIP-44 gap limit, past which a wallet restoring from the exported phrase stops finding the
+ * addresses. Migration 9 has the full argument and the measurement.
+ *
+ * `insert on conflict do nothing` then `update returning`, both inside the caller's transaction:
+ * the insert creates the path's counter on first use and blocks behind a concurrent creator rather
+ * than racing it, and the UPDATE's row lock is what serialises the allocation. See `findSeed` for
+ * why the lock, not the read, is the whole point.
+ */
+export async function takeNextIndex(sql: Tx, seedId: string, coinType: number): Promise<number> {
+  await sql`
+    insert into custody_seed_paths (seed_id, coin_type, next_index)
+    values (${seedId}, ${coinType}, 0)
+    on conflict (seed_id, coin_type) do nothing
+  `
   const rows = await sql<{ next_index: number }[]>`
-    update custody_seeds set next_index = next_index + 1
-     where id = ${seedId}
+    update custody_seed_paths set next_index = next_index + 1
+     where seed_id = ${seedId} and coin_type = ${coinType}
      returning next_index - 1 as next_index
   `
   const row = rows[0]
-  if (!row) throw new Error(`no custody seed ${seedId}`)
+  if (!row) throw new Error(`no custody seed path ${seedId}/${coinType}`)
+
+  // Keep the whole-seed counter ahead of every path. Nothing reads it any more, and that is exactly
+  // why it must stay correct: it is what the PREVIOUS image allocates from, so holding it above
+  // everything allocated here is what makes a rollback unable to mint an address twice.
+  await sql`
+    update custody_seeds set next_index = greatest(next_index, ${row.next_index + 1})
+     where id = ${seedId}
+  `
   return row.next_index
 }
 
