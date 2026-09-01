@@ -48,6 +48,7 @@ const ALL_TABLES = [
   'custody_token_contracts',
   'custody_treasuries',
   'custody_keys',
+  'custody_seed_paths',
   'custody_seeds',
   'outbox_deliveries',
   'event_subscriptions',

@@ -240,15 +240,17 @@ test('a `pool` payout address is mintable on the chains the pool mines, and is H
     assert.equal('privateKey' in key, false)
   }
   // The coin types are the chains' own — LTC 2, BTC 0 — and NOT the family's, which is Bitcoin's 0
-  // for both. Purpose is absent from the path entirely: the account level stays `0'` and what
-  // separates two addresses is the index on the (user, family) seed.
+  // for both. Purpose is absent from the path entirely: the account level stays `0'`, and the two
+  // addresses are separated by the COIN TYPE alone. Both are index 0 because each path carries its
+  // own counter since migration 9; before it they were 1 and 0, and the difference in index masked
+  // the fact that the coin type was doing the work.
   const paths = await sql<{ chain: string; derivation_path: string }[]>`
     select chain, derivation_path from custody_keys where purpose = 'pool' order by chain
   `
   assert.deepEqual(
     paths.map((row) => [row.chain, row.derivation_path]),
     [
-      ['bitcoin', "m/44'/0'/0'/0/1"],
+      ['bitcoin', "m/44'/0'/0'/0/0"],
       ['litecoin', "m/44'/2'/0'/0/0"],
     ],
   )

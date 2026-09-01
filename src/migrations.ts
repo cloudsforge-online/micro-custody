@@ -534,6 +534,95 @@ export const MIGRATIONS: readonly Migration[] = [
           check (purpose in ('deposit','treasury','deployer','user','pool'));
     `,
   },
+  {
+    version: 9,
+    name: 'seed-index-per-derivation-path',
+    /**
+     * One address index counter per derivation path, instead of one per seed.
+     *
+     * -- THE DEFECT ---------------------------------------------------------------------------
+     *
+     * `custody_seeds.next_index` was one counter for the whole seed, and `hd.ts`'s header describes
+     * it as allocated monotonically per (user, family) seed and never reused. That is true, and it
+     * is not enough, because a single seed does not derive under a single path. `coinTypeFor` varies
+     * the BIP-44 coin type by BOTH network (testnet is 1 for every coin, SLIP-0044's own rule) and
+     * chain (`CHAIN_COIN_TYPE[chain] ?? COIN_TYPE[family]`), so one seed legitimately serves several
+     * paths at once -- the `bitcoin` family alone spans BTC at 0', LTC at 2' and DOGE at 3'.
+     *
+     * Sharing one counter across those paths means the indexes INTERLEAVE. Allocate for BTC, then
+     * LTC, then BTC, and the BTC path holds 0 and 2 while the LTC path holds 1. Each path is left
+     * with holes, and neither is contiguous.
+     *
+     * -- WHY THAT LOSES MONEY, EVENTUALLY -----------------------------------------------------
+     *
+     * BIP-44 restore scans a path until it has seen a run of unused addresses -- the gap limit, 20
+     * by near-universal convention. A hole shorter than that is invisible. A run of 20 is not: every
+     * address beyond it is unreachable to a standard wallet restoring from the phrase, at the exact
+     * path `custody_keys.derivation_path` states. The funds are not gone -- the platform can still
+     * derive them -- but the user who exports their mnemonic, which `exports.ts` exists to let them
+     * do, cannot see them. That is the silent-loss-on-restore failure `hd.ts` is written to prevent,
+     * arriving by a different door.
+     *
+     * It takes 20 consecutive allocations on other paths to open that door. Measured on the live
+     * estate 2026-09-01, the worst case is a hole of ONE, on two seeds of the `bitcoin` family split
+     * across coin 0' and coin 2'. So this migration is not repairing damage; it is closing the route
+     * to it while the cost of closing it is two rows.
+     *
+     * -- WHY NOT PUT `network` ON THE SEED (micro-org#510) -------------------------------------
+     *
+     * That issue proposed keying `custody_seeds` by network as well, which would give a user two
+     * mnemonics per family. It would also not fix this: the `bitcoin` family interleaves across
+     * three chains WITHIN one network, and a network column does not separate those. One mnemonic
+     * per (user, family), derived at the path the network and chain already select, is what BIP-44
+     * is for -- so the seed stays as it is and the COUNTER moves.
+     *
+     * -- THE BACKFILL IS EXACT, NOT A GUESS ---------------------------------------------------
+     *
+     * Each path's counter starts one past the highest index that path has actually used, read out of
+     * `derivation_path` itself rather than inferred. Two shapes exist and both are parsed: six
+     * segments for BIP-32 (m/44'/coin'/0'/0/index) and five for the ed25519/SLIP-0010 families
+     * (m/44'/coin'/index'/0'). A seed that has never derived gets no row at all and starts at 0 on
+     * first use, which is the same thing by a cheaper route. `chr(39)` is the apostrophe the
+     * hardened-path notation uses; spelling it that way keeps this SQL readable through the two
+     * layers of quoting it passes on its way to the server.
+     *
+     * Existing holes are NOT closed, and must not be: those indexes belong to addresses that already
+     * exist at those paths. The migration stops new holes from opening.
+     *
+     * -- SAFE IN BOTH DIRECTIONS DURING A ROLLOUT ---------------------------------------------
+     *
+     * `custody_seeds.next_index` is deliberately kept and still advanced by `takeNextIndex`, as a
+     * high-water mark of total allocations. It is what makes the deploy reversible: the previous
+     * image allocates from it, and because every per-path counter is <= it and the new code pushes
+     * it past whatever it just handed out, a rolled-back replica allocates strictly ABOVE anything
+     * the new code used. Neither direction can mint the same address twice. Dropping the column is a
+     * later contract step, not this one.
+     */
+    up: `
+      create table if not exists custody_seed_paths (
+        seed_id    uuid    not null references custody_seeds (id) on delete cascade,
+        coin_type  integer not null,
+        next_index integer not null default 0,
+        primary key (seed_id, coin_type),
+        constraint custody_seed_paths_next_index_ck check (next_index >= 0)
+      );
+
+      insert into custody_seed_paths (seed_id, coin_type, next_index)
+      select seed_id, coin_type, max(idx) + 1
+        from (
+          select k.seed_id,
+                 rtrim(split_part(k.derivation_path, '/', 3), chr(39))::int as coin_type,
+                 case when array_length(string_to_array(k.derivation_path, '/'), 1) = 6
+                      then split_part(k.derivation_path, '/', 6)::int
+                      else rtrim(split_part(k.derivation_path, '/', 4), chr(39))::int
+                 end as idx
+            from custody_keys k
+           where k.seed_id is not null and k.derivation_path is not null
+        ) used
+       group by seed_id, coin_type
+          on conflict (seed_id, coin_type) do nothing;
+    `,
+  },
 ]
 
 /**
