@@ -195,6 +195,9 @@ test('LITECOIN: a Bitcoin deposit address and a Litecoin one are different keys'
     select address, derivation_path from custody_keys where address in (${ltc}, ${btc})
   `
   const byAddress = new Map(paths.map((r) => [r.address, r.derivation_path]))
-  assert.equal(byAddress.get(btc), "m/44'/0'/0'/0/1", 'Bitcoin mainnet is coin type 0')
+  // BOTH sit at index 0, each on its own path's counter (migration 9). That is the point: the two
+  // addresses now differ by coin type ALONE, with the index held equal, which is the property this
+  // test's opening comment asks for and could not demonstrate while one counter served both paths.
+  assert.equal(byAddress.get(btc), "m/44'/0'/0'/0/0", 'Bitcoin mainnet is coin type 0')
   assert.equal(byAddress.get(ltc), "m/44'/1'/0'/0/0", 'Litecoin TESTNET is coin type 1, like every testnet')
 })
