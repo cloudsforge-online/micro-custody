@@ -384,6 +384,14 @@ interface Sample {
 function routeSamples(): Sample[] {
   return [
     { method: 'GET', route: '/livez', expect: 200 },
+    /*
+     * The erasure webhook (micro-org#534). Driven with NO signature, so it is refused at the MAC
+     * check — which is exactly the state this scan cares about: it is the one route on this server
+     * that takes no bearer token, so it is the one whose refusal body an unauthenticated stranger
+     * can read. A refusal that named an address, a derivation path or a key version would be a leak
+     * reachable without any credential at all.
+     */
+    { method: 'POST', route: '/v1/events', body: { topic: 'identity.user.deleted' }, expect: 401 },
     { method: 'GET', route: '/readyz', expect: 200 },
     { method: 'GET', route: '/metrics', expect: 200 },
     {
