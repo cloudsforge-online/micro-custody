@@ -17,9 +17,14 @@
  * measured conditions under which that stops being true.
  */
 
-import { createHmac, timingSafeEqual } from 'node:crypto'
 import type { Sql, TransactionSql } from 'postgres'
-import type { EventVersion } from '@cloudsforge/contracts-events'
+import {
+  EVENT_ID_HEADER,
+  SIGNATURE_HEADER,
+  signDelivery,
+  verifyDelivery,
+  type EventVersion,
+} from '@cloudsforge/contracts-events'
 import { HttpClient } from '@cloudsforge/http'
 import type { Logger } from '@cloudsforge/telemetry'
 import type { Handler } from '@cloudsforge/jobs'
@@ -149,23 +154,36 @@ export async function withOutbox<T>(
 /* ------------------------------------------------------------------------ signing */
 
 /**
- * Exported since micro-org#534 so `server.ts` can VERIFY an inbound event with the same header
- * constant the relay signs with. A second spelling in the route would be a header mismatch nothing
- * tests — the request would simply arrive unsigned and be refused.
+ * ── THE SIGNATURE WAS THIS SERVICE'S OWN, AND NOTHING ELSE IN THE ESTATE SPOKE IT ─────────────
+ *
+ * Until micro-org#534 this file declared `SIGNATURE_HEADER = 'x-cloudsforge-signature'` and signed
+ * `sha256=<hmac over the body>` — a locally-declared header name and a locally-declared scheme.
+ * The contract (`@cloudsforge/contracts-events`) uses `cf-signature` and
+ * `t=<seconds>,v1=<hmac over "<seconds>.<body>">`, and every consumer that imports it verifies
+ * exactly that. `micro-ledger` records the same drift being found in four other producers; custody
+ * was one of the copies that had not yet been brought back.
+ *
+ * MEASURED, not inferred. On 2026-09-02, with the erasure subscription live and the SAME
+ * `OUTBOX_SIGNING_SECRET` in identity and here (compared by digest, never by value), identity's
+ * relay logged `POST http://custody:4000/v1/events -> 401` on all 50 attempted deliveries while
+ * ledger — which already delegates to the contract — took all 50. A hand-signed probe in the old
+ * scheme was accepted, which is what proved the key was right and the SCHEME was wrong.
+ *
+ * The exported names stay, so no call site or test changes; the implementations are the
+ * contract's, so they cannot drift again. This fixes BOTH directions at once: the inbound erasure
+ * webhook, and this service's own outbound deliveries, which were signed under a header no
+ * consumer reads.
  */
-export const SIGNATURE_HEADER = 'x-cloudsforge-signature'
+export { EVENT_ID_HEADER, SIGNATURE_HEADER }
 
-/** `sha256=<hex>` over the exact bytes sent, so a subscriber verifies before parsing. */
+/** `t=<seconds>,v1=<hex>` over `"<seconds>.<body>"`, under `cf-signature`. The contract's. */
 export function signEvent(body: string, secret: string): string {
-  return `sha256=${createHmac('sha256', secret).update(body).digest('hex')}`
+  return signDelivery(body, secret)
 }
 
-/** Timing-safe, because a byte-at-a-time comparison of a MAC is a byte-at-a-time forgery oracle. */
+/** Timing-safety and the freshness window both live in the contract's verifier. */
 export function verifyEventSignature(body: string, secret: string, presented: string): boolean {
-  const expected = Buffer.from(signEvent(body, secret))
-  const actual = Buffer.from(presented)
-  if (expected.length !== actual.length) return false
-  return timingSafeEqual(expected, actual)
+  return verifyDelivery(body, presented, secret).ok
 }
 
 /* ------------------------------------------------------------------------ relay */
@@ -335,7 +353,7 @@ async function deliver(
       // The event id is the idempotency key, which is what makes this POST safe to retry and is
       // the same value the subscriber dedupes on.
       idempotencyKey: envelope.id,
-      headers: { [SIGNATURE_HEADER]: signature, 'x-event-id': envelope.id },
+      headers: { [SIGNATURE_HEADER]: signature, [EVENT_ID_HEADER]: envelope.id },
       ...(envelope.correlationId ? { requestId: envelope.correlationId } : {}),
     })
     await deps.sql`
