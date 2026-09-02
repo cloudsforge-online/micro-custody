@@ -54,6 +54,8 @@ import {
   type ExportDeps,
   type ExportFormat,
 } from './exports.ts'
+import { USER_DELETED_TOPIC, eraseUser } from './erasure.ts'
+import { SIGNATURE_HEADER, verifyEventSignature, withInbox } from './outbox.ts'
 import { ADDRESS_WINDOW_MS, SIGN_WINDOW_MS, decide, windowStart } from './ratelimit.ts'
 import { remainingCount } from './reencrypt.ts'
 import {
@@ -96,6 +98,14 @@ export interface ServerDeps {
   readonly keys: KeyDeps
   readonly exports: ExportDeps
   readonly limits: { readonly signPerMinute: number; readonly addressPerHour: number }
+  /**
+   * The estate-wide `OUTBOX_SIGNING_SECRET`, which this service already reads to SIGN its own
+   * outbound deliveries. `POST /v1/events` verifies inbound ones with the same key rather than a
+   * second accept list: identity's relay signs with it, a separate secret would be one more thing
+   * to provision and rotate, and the MAC — not a bearer token — is what authenticates the relay,
+   * which is a service and carries no user token.
+   */
+  readonly eventSigningSecret: string
   readonly now?: () => number
   readonly beforeScrape?: () => Promise<void>
 }
@@ -112,6 +122,12 @@ const MAX_BODY_BYTES = 256 * 1024
 /** Kept equal to migration 6's `custody_keys_idempotency_ck`, so the two cannot disagree. */
 const MAX_IDEMPOTENCY_KEY_LENGTH = 255
 const SAFE_REQUEST_ID = /^[A-Za-z0-9_-]{1,64}$/
+/**
+ * Both the event id and the subject are uuids, and both are checked before anything is written.
+ * A subject that is not one would be swept through `replace()` as a raw substring, and a short or
+ * empty one would match — and rewrite — text belonging to other people.
+ */
+const ERASURE_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 const NETWORKS = new Set(['mainnet', 'testnet'])
 /**
  * The purposes the mint route accepts. Kept equal to `custody_keys_purpose_ck` (migrations 4 and 8),
@@ -357,6 +373,73 @@ function buildRoutes(): Route[] {
           ctx.log.warn('gauge refresh failed; serving the previous values', { err })
         }
         return { status: 200, text: deps.metrics.render(), contentType: 'text/plain; version=0.0.4; charset=utf-8' }
+      },
+    },
+
+    /* ---------------------------------------------------------------- erasure */
+    {
+      method: 'POST',
+      path: '/v1/events',
+      handle: async (ctx, deps) => {
+        const raw = await readRawBody(ctx.req)
+        const presented = headerOf(ctx.req, SIGNATURE_HEADER)
+        if (!presented || !verifyEventSignature(raw, deps.eventSigningSecret, presented)) {
+          ctx.log.warn('an inbound event failed its signature check')
+          return errorReply(401, 'bad_signature', 'the event signature did not verify', ctx.requestId)
+        }
+
+        let envelope: Record<string, unknown>
+        try {
+          const parsed: unknown = JSON.parse(raw)
+          if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+            throw new BadRequestError('an event envelope must be a JSON object')
+          }
+          envelope = parsed as Record<string, unknown>
+        } catch (err) {
+          if (err instanceof BadRequestError) throw err
+          throw new BadRequestError('the event body is not valid JSON')
+        }
+
+        const topic = typeof envelope['topic'] === 'string' ? envelope['topic'] : ''
+        const eventId = typeof envelope['id'] === 'string' ? envelope['id'] : ''
+        if (!ERASURE_UUID.test(eventId)) throw new BadRequestError('an event envelope must carry a uuid id')
+        if (topic !== USER_DELETED_TOPIC) {
+          // Accepted and ignored, with a 202. A 4xx would make the relay retry, for ever, an event
+          // it is right to send and this service is right not to act on.
+          return { status: 202, body: { status: 'ignored', topic } }
+        }
+
+        const payload =
+          typeof envelope['payload'] === 'object' && envelope['payload'] !== null
+            ? (envelope['payload'] as Record<string, unknown>)
+            : {}
+        // `payload.userId`, not `envelope.actor`: on this topic the actor is whoever ASKED for the
+        // deletion, which is the deleted user only when they deleted themselves.
+        const named = typeof payload['userId'] === 'string' ? payload['userId'] : ''
+        const bare = named.startsWith('user:') ? named.slice('user:'.length) : named
+        // 400 rather than a quiet 202: an erasure that cannot be performed must not be
+        // acknowledged as performed.
+        if (!ERASURE_UUID.test(bare)) throw new BadRequestError(`${USER_DELETED_TOPIC} requires a uuid userId`)
+
+        const done = deps.lifecycle.track()
+        try {
+          // One database, both networks — `network` is a column here, so there is no per-plane
+          // sweep to do and no way for one network's rows to be left behind (micro-org#474).
+          const outcome = await withInbox(deps.keys.sql, topic, eventId, (tx) => eraseUser(tx, bare))
+          if (outcome.status === 'processed') {
+            // Counts only. The subject is never logged — it is what we were asked to forget.
+            ctx.log.info('anonymised a subject on identity.user.deleted', { eventId, ...outcome.value })
+          }
+          return {
+            status: 202,
+            body:
+              outcome.status === 'processed'
+                ? { status: 'anonymised', ...outcome.value }
+                : { status: 'duplicate' },
+          }
+        } finally {
+          done()
+        }
       },
     },
 
@@ -1105,6 +1188,26 @@ function enumField(
     throw new BadRequestError(`${name} must be one of ${[...allowed].join(', ')}`)
   }
   return value
+}
+
+/**
+ * The body as the SIGNER saw it.
+ *
+ * `readJson` cannot be reused: an HMAC is over bytes, and `JSON.parse` then `JSON.stringify` is not
+ * the identity function — key order, whitespace and number formatting all survive the wire and
+ * none of them survives a round trip. Verifying a re-serialised body would reject every genuine
+ * delivery whose producer spelled its JSON differently.
+ */
+async function readRawBody(req: IncomingMessage): Promise<string> {
+  const chunks: Buffer[] = []
+  let size = 0
+  for await (const chunk of req) {
+    const buffer = chunk as Buffer
+    size += buffer.length
+    if (size > MAX_BODY_BYTES) throw new BadRequestError('request body too large')
+    chunks.push(buffer)
+  }
+  return Buffer.concat(chunks).toString('utf8')
 }
 
 async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> {

@@ -63,6 +63,9 @@ import {
   type RunningServer,
 } from './testsupport.ts'
 
+/** Any value: these suites never post a signed event, they only satisfy `ServerDeps`. */
+const EVENT_SECRET = 'test-event-signing-secret'
+
 const DAY = 24 * 3_600_000
 
 const TOKENS = {
@@ -117,6 +120,7 @@ before(async () => {
     keys: h.keys,
     exports: h.exports,
     limits: { signPerMinute: 500, addressPerHour: 500 },
+    eventSigningSecret: EVENT_SECRET,
     now: () => h.clock(),
   })
 

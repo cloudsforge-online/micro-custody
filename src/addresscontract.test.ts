@@ -47,6 +47,9 @@ import {
   type RunningServer,
 } from './testsupport.ts'
 
+/** Any value: these suites never post a signed event, they only satisfy `ServerDeps`. */
+const EVENT_SECRET = 'test-event-signing-secret'
+
 const TOKENS = { wallet: serviceToken('wallet', [ADDRESS_CREATE_SCOPE]) }
 
 let sql: postgres.Sql
@@ -66,6 +69,7 @@ before(async () => {
     keys: h.keys,
     exports: h.exports,
     limits: { signPerMinute: 5, addressPerHour: 50 },
+    eventSigningSecret: EVENT_SECRET,
     now: () => h.clock(),
   })
 })

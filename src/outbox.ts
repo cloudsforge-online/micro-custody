@@ -148,7 +148,12 @@ export async function withOutbox<T>(
 
 /* ------------------------------------------------------------------------ signing */
 
-const SIGNATURE_HEADER = 'x-cloudsforge-signature'
+/**
+ * Exported since micro-org#534 so `server.ts` can VERIFY an inbound event with the same header
+ * constant the relay signs with. A second spelling in the route would be a header mismatch nothing
+ * tests — the request would simply arrive unsigned and be refused.
+ */
+export const SIGNATURE_HEADER = 'x-cloudsforge-signature'
 
 /** `sha256=<hex>` over the exact bytes sent, so a subscriber verifies before parsing. */
 export function signEvent(body: string, secret: string): string {
