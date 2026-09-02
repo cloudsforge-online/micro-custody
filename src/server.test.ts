@@ -34,6 +34,9 @@ import {
   type RunningServer,
 } from './testsupport.ts'
 
+/** Any value: these suites never post a signed event, they only satisfy `ServerDeps`. */
+const EVENT_SECRET = 'test-event-signing-secret'
+
 const SIGN_SCOPES = ['custody:sign:deposit', 'custody:sign:treasury', 'custody:sign:deployer']
 /**
  * A chain custody holds no keys for, derived from the registry rather than named. See
@@ -81,6 +84,7 @@ before(async () => {
     keys: h.keys,
     exports: h.exports,
     limits: { signPerMinute: 5, addressPerHour: 10 },
+    eventSigningSecret: EVENT_SECRET,
     now: () => h.clock(),
   })
 })

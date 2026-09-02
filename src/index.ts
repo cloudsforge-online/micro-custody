@@ -124,6 +124,9 @@ const server = createServer({
   keys,
   exports,
   limits: { signPerMinute: env.signRatePerMinute, addressPerHour: env.addressRatePerHour },
+  // The same key the relay below signs WITH. `POST /v1/events` verifies inbound deliveries with it
+  // — micro-org#534.
+  eventSigningSecret: env.outboxSigningSecret,
   // Sampled at scrape time rather than on a timer. There is no `setInterval` in this repository and
   // CI greps for one — rule 8.
   beforeScrape: async () => {

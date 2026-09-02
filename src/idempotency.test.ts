@@ -63,6 +63,9 @@ import {
   type RunningServer,
 } from './testsupport.ts'
 
+/** Any value: these suites never post a signed event, they only satisfy `ServerDeps`. */
+const EVENT_SECRET = 'test-event-signing-secret'
+
 const OPERATOR = '99999999-9999-4999-8999-999999999999'
 const TOKENS = {
   wallet: serviceToken('wallet', [ADDRESS_CREATE_SCOPE]),
@@ -91,6 +94,7 @@ before(async () => {
     // High enough that the rate limiter never decides one of these cases for us: a 429 and a
     // deduplicated 200 are both "no second address", and only one of them is what is being proved.
     limits: { signPerMinute: 50, addressPerHour: 500 },
+    eventSigningSecret: EVENT_SECRET,
     now: () => h.clock(),
   })
 })
